@@ -411,11 +411,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       var val = raw ? JSON.parse(raw) : null;
       return val || fallback;
     } catch (e) {
+      // 内容损坏等：回退默认值，控制台留痕便于排查
+      console.warn('读取 ' + key + ' 失败，已回退默认值：', e);
       return fallback;
     }
   }
   function saveJson(key, val) {
-    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {
+      // 隐私模式/配额超限：只是不持久化，不影响本次会话
+      console.warn('写入 ' + key + ' 失败（可能处于隐私模式或存储已满）：', e);
+    }
   }
 
   // =============== 页面状态 ===============
@@ -754,10 +759,19 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     try {
       var p = targetParams(srv);
       p.set('name', file.name);
-      var res = await fetch('/upload?' + p.toString(), { method: 'POST', body: file });
+      var res;
+      try {
+        res = await fetch('/upload?' + p.toString(), { method: 'POST', body: file });
+      } catch (e) {
+        // 网络层异常（服务不可达/连接中断）：转成中文提示，避免露出英文堆栈
+        throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+      }
       var data = {};
-      try { data = await res.json(); } catch (e) { /* 非 JSON 响应按失败处理 */ }
-      if (!res.ok || !data.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      var jsonOk = true;
+      try { data = await res.json(); } catch (e) { jsonOk = false; } // 非 JSON 响应：按状态码继续报错
+      if (!res.ok || !jsonOk || !data.ok) {
+        throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
+      }
       recordUpload(data, file.name, srv);
 
       // 成功态：方式徽标 + 路径（有 URL 再加一行）+ 各自的复制按钮
@@ -782,13 +796,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 批量入口：过滤出图片后串行逐个上传（后端上传队列本身串行，前端逐个展示结果）
   async function uploadFiles(fileList) {
     var files = [];
+    var skipped = 0; // 非 image/* 文件计数，用于提示用户有文件被忽略
     for (var i = 0; i < fileList.length; i++) {
       if (fileList[i].type.indexOf('image/') === 0) files.push(fileList[i]);
+      else skipped++;
     }
     if (!files.length) {
-      hint('未检测到图片文件（仅支持图片类型）', true);
+      hint(skipped ? '已忽略 ' + skipped + ' 个非图片文件（仅支持 image/* 类型）' : '未检测到图片文件（仅支持图片类型）', true);
       return;
     }
+    if (skipped) hint('已忽略 ' + skipped + ' 个非图片文件，仅上传 ' + files.length + ' 张图片', true);
     var srv = currentServer();
     for (var j = 0; j < files.length; j++) {
       await uploadOne(files[j], srv);
@@ -837,15 +854,44 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // =============== 历史图库 ===============
 
-  // 拉取本机图库 → 对账 → 渲染
+  // 历史区错误占位：拉取失败时显示中文提示，绝不动 localStorage 记录
+  function showHistoryError(message) {
+    historyCount.textContent = '';
+    grid.textContent = '';
+    var p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = '历史加载失败：' + message + '（本地记录未动，可刷新重试）';
+    grid.appendChild(p);
+  }
+
+  // 拉取序号守卫：只认最后一次发起的请求结果，
+  // 防止并发刷新时旧响应（尤其是失败的旧响应）覆盖新结果
+  var historySeq = 0;
+
+  // 拉取本机图库 → 对账 → 渲染。
+  // 关键：失败时直接返回（跳过对账与渲染）——若以空清单继续对账，
+  // 会把 localStorage 中的推送记录误当「本地文件已删除」而全部清空；
+  // 成功但清单为空（文件确实都删了）才允许正常对账清理。
   async function refreshHistory() {
+    var seq = ++historySeq;
     try {
-      var res = await fetch('/api/library');
-      var data = await res.json();
-      libFiles = Array.isArray(data.files) ? data.files : [];
+      var res;
+      try {
+        res = await fetch('/api/library');
+      } catch (e) {
+        throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+      }
+      var data = null;
+      try { data = await res.json(); } catch (e) { data = null; } // 非 JSON 响应按失败处理
+      if (!res.ok || !data || !Array.isArray(data.files)) {
+        throw new Error((data && data.error) || ('HTTP ' + res.status));
+      }
+      if (seq !== historySeq) return; // 已有更新的请求在途，丢弃本次过期结果
+      libFiles = data.files;
     } catch (e) {
-      libFiles = [];
-      hint('获取图库失败：' + (e.message || e), true);
+      if (seq !== historySeq) return; // 过期失败同样让位给新请求
+      showHistoryError(e && e.message ? e.message : String(e));
+      return;
     }
     reconcile();
     renderGrid();
@@ -996,8 +1042,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     try {
       var res = await fetch('/files/' + encodeURIComponent(name), { method: 'DELETE' });
       var data = {};
-      try { data = await res.json(); } catch (e) { /* 非 JSON 响应按失败处理 */ }
-      if (!res.ok || !data.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      var jsonOk = true;
+      try { data = await res.json(); } catch (e) { jsonOk = false; } // 非 JSON 响应按失败处理
+      if (!res.ok || !jsonOk || !data.ok) {
+        throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
+      }
       delete history[name];
       saveJson(HISTORY_KEY, history);
       refreshHistory();
