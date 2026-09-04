@@ -21,6 +21,7 @@ import {
   validateDir,
   isValidStoredName,
   mimeOf,
+  buildProbeScript,
   run,
   syncToRemote,
 } from '../server.js';
@@ -194,6 +195,22 @@ describe('纯函数：mimeOf', () => {
     assert.equal(mimeOf('noext'), 'application/octet-stream');
     assert.equal(mimeOf('x.txt'), 'application/octet-stream');
     assert.equal(mimeOf('x.tar.gz'), 'application/octet-stream');
+  });
+});
+
+describe('纯函数：buildProbeScript（妙传探测脚本）', () => {
+  test('探测脚本包含 md5 内容比对（快照断言）', () => {
+    // 文件名前 32 位 hex 即内容 md5：同名必须同内容才算已存在，防残缺文件被误判
+    const script = buildProbeScript(`${HEX32}-x.png`, '/tmp/d');
+    assert.equal(
+      script,
+      `mkdir -p '/tmp/d'; if test -f '/tmp/d/${HEX32}-x.png' && md5sum '/tmp/d/${HEX32}-x.png' 2>/dev/null | grep -q '^${HEX32}'; then echo EXISTS; else echo MISSING; fi`,
+    );
+  });
+
+  test('名字不符合 <md5>- 约定时条件退化为 false：强制 MISSING（宁可重传不跳过）', () => {
+    const script = buildProbeScript('foo.png', '/tmp/d');
+    assert.equal(script, `mkdir -p '/tmp/d'; if false; then echo EXISTS; else echo MISSING; fi`);
   });
 });
 
@@ -462,6 +479,10 @@ describe('HTTP 完整流程：上传 → 图库 → 读取 → 删除', () => {
     assert.equal(localName, `${md5hex(bytes)}-flow.png`);
     assert.equal(remotePath, path.resolve(snapDir, localName));
 
+    // 原子写入：上传完成后目录中不应有 .tmp 临时文件残留（已全部 rename 为最终名）
+    const leftovers = fs.readdirSync(snapDir).filter((f) => f.endsWith('.tmp'));
+    assert.deepEqual(leftovers, []);
+
     // 2) 图库包含该文件，字段齐全
     const lib = await (await fetch(`${base}/api/library`)).json();
     const hit = lib.files.find((f) => f.name === localName);
@@ -549,6 +570,19 @@ describe('E2E：真实 ssh 同步（需 SNAP_PUSH_E2E=1 与本机 sshd 免密）
     assert.equal(r1.method, 'rsync');
     const r2 = await syncToRemote(localPath, name, { host: '127.0.0.1', user, dir: remoteDir });
     assert.equal(r2.method, 'skip');
+  });
+
+  test('远端文件内容损坏（md5 不匹配）→ 不再妙传，重传修复（自愈）', async () => {
+    const name = `${HEX32}-e2e-corrupt.png`;
+    const target = { host: '127.0.0.1', user, dir: remoteDir };
+    await syncToRemote(localPath, name, target); // 先正常上传一次
+
+    // 直接篡改远端文件内容，模拟历史残缺（中断的 scp/rsync 残留）
+    await run('ssh', [...SSH_ARGS, `${user}@127.0.0.1`, `echo broken > '${remoteDir}/${name}'`]);
+
+    // md5 探测发现内容不符 → MISSING → 走 rsync 重传而非 skip
+    const r = await syncToRemote(localPath, name, target);
+    assert.equal(r.method, 'rsync');
   });
 
   test('rsync 报 not found → scp 兜底', async () => {

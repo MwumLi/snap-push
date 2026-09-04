@@ -184,18 +184,41 @@ async function scpFallback(localPath, name, target) {
 }
 
 /**
+ * 构造 ssh 妙传探测脚本（在远端 shell 执行）：
+ *   1) mkdir -p 确保远端目录存在；
+ *   2) 存在性 + md5 内容比对——文件名前 32 位 hex 即内容 md5（md5Name 约定），
+ *      同名必须同内容才算「已存在」。仅凭 test -f 存在性判断会把历史残缺文件
+ *      （中断的 scp/rsync 残留）误判为已上传而妙传跳过，造成静默损坏；
+ *   3) 远端没有 md5sum 时管道输出为空 → grep 不命中 → MISSING → 走上传。
+ *      安全默认：宁可重传也不跳过（rsync -a 增量下重传代价可忽略）。
+ * 名字不符合 <md5>- 约定时（正常流程不会发生）条件退化为 false：强制 MISSING。
+ * 安全说明：name/dir 进入本函数前均已通过白名单校验，期望 md5 为纯 hex，
+ *           嵌入远端命令串没有注入面。
+ */
+export function buildProbeScript(name, dir) {
+  const expectedMd5 = /^[0-9a-f]{32}/.exec(name)?.[0];
+  const remoteFile = `${dir}/${name}`;
+  const existsCheck = expectedMd5
+    ? `test -f '${remoteFile}' && md5sum '${remoteFile}' 2>/dev/null | grep -q '^${expectedMd5}'`
+    : 'false';
+  return `mkdir -p '${dir}'; if ${existsCheck}; then echo EXISTS; else echo MISSING; fi`;
+}
+
+/**
  * 把本地文件同步到远程服务器，返回实际使用的传输方式：
- *   1. ssh 一条命令完成「建目录 + 存在性检查」——远端已有同内容文件则妙传跳过（method: skip）；
+ *   1. ssh 一条命令完成「建目录 + md5 内容比对」——远端已有同内容文件才妙传
+ *      跳过（method: skip），残缺文件会被判 MISSING 重传修复（自愈）；
  *   2. rsync 增量上传（method: rsync）；
  *   3. rsync 不可用（远端缺失，stderr 报 not found；或本地未安装）→ scp 兜底（method: scp）。
  * 任何失败抛出带 stderr 摘要的中文 Error。
+ * 说明：scp 直写目标名并非原子，但配合 md5 探测，残缺文件会在下次上传时
+ *       被发现并重传修复，无需额外原子化。
  * 安全说明：host/user/dir/name 均已通过白名单校验后才进入本函数，嵌入远端命令串是安全的；
  *           本地子进程一律使用参数数组，不经 shell。
  */
 export async function syncToRemote(localPath, name, { host, user, dir }) {
-  // 第一步：ssh 探测（mkdir -p 保证远端目录存在；EXISTS/MISSING 判断能否妙传）
-  const probeScript = `mkdir -p '${dir}' && (test -f '${dir}/${name}' && echo EXISTS || echo MISSING)`;
-  const probe = await run('ssh', [...SSH_ARGS, `${user}@${host}`, probeScript]);
+  // 第一步：ssh 探测（mkdir -p 保证远端目录存在；md5 比对判断能否妙传）
+  const probe = await run('ssh', [...SSH_ARGS, `${user}@${host}`, buildProbeScript(name, dir)]);
   if (probe.code !== 0) {
     throw new Error(`ssh 探测失败（退出码 ${probe.code}）：${summarizeStderr(probe.stderr)}`);
   }
@@ -358,8 +381,22 @@ async function handleUpload(req, res, params, ctx) {
     await ensureDir(ctx.snapDir);
     const localPath = path.join(ctx.snapDir, storedName);
     if (!fs.existsSync(localPath)) {
-      // md5 内容寻址：同名即同内容，已存在则跳过写入
-      await fs.promises.writeFile(localPath, bytes);
+      // 原子写入：先写同目录临时文件，再 rename 到最终名（同文件系统 rename 原子）。
+      // 直接写最终路径一旦中断（进程被杀/磁盘满），会留下「名字合法但内容残缺」
+      // 的文件，被图库收录并同步远端，造成静默损坏；临时文件以 . 开头、.tmp 结尾，
+      // 不匹配 isValidStoredName，即使残留也不会进入图库。
+      const tmpPath = path.join(
+        ctx.snapDir,
+        `.${storedName}.${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`,
+      );
+      try {
+        await fs.promises.writeFile(tmpPath, bytes);
+        await fs.promises.rename(tmpPath, localPath);
+      } catch (err) {
+        // 尽力清理半成品临时文件（清理失败不影响原始错误抛出）
+        await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
+        throw err;
+      }
     }
     if (!target) {
       // 仅本机：remotePath 返回本机绝对路径
