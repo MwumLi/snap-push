@@ -1,3 +1,33 @@
+# ===== 依赖与构建 =====
 node_modules/
-.DS_Store
+coverage/
+dist/
+build/
+*.tsbuildinfo
+*.tgz
+
+# ===== Node 调试与日志 =====
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 *.log
+
+# ===== snap-push 本地数据（如用仓库内目录作 SNAP_PUSH_DIR）=====
+snap-push/
+uploads/
+
+# ===== 编辑器 / IDE =====
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== opencode 本地缓存（保留 .opencode/ 下的配置，如 opencode.json）=====
+.opencode/vision/
