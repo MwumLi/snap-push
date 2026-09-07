@@ -1327,8 +1327,11 @@ export function start() {
   return server;
 }
 
-// 入口判断：只有直接运行（node server.js）时才自动启动；
-// 被测试或其它模块 import 时不产生任何副作用。
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// 入口判断：node server.js、curl | node 管道、node -e 内联执行时均自动启动；
+// 被其它模块 import（例如测试用 node --test 运行）时不产生任何副作用。
+// 说明：argv 无脚本参数（stdin/内联）即视为直跑——配合
+//   curl -fsSL <server.js> | node --input-type=module  可直接运行、无需落盘。
+const isDirectRun = !process.argv[1] || import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
   start();
 }
