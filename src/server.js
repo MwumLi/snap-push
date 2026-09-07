@@ -404,6 +404,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 写入失败只是不持久化，都不阻断页面功能。
   var SERVERS_KEY = 'snap-push.servers';
   var HISTORY_KEY = 'snap-push.history';
+  var TARGET_KEY = 'snap-push.target'; // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
 
   function loadJson(key, fallback) {
     try {
@@ -544,7 +545,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return serverById(targetSel.value);
   }
 
+  // 读取上次记住的目标；仅接受 'local' 或仍存在的服务器 id（配置被删/被篡改则视为无效）
+  function savedTarget() {
+    var v = loadJson(TARGET_KEY, null); // loadJson 会 JSON 解码；未存过返回 null
+    return (v === 'local' || serverById(v)) ? v : null;
+  }
+
   // 重渲染目标下拉：本机 + 全部服务器（显示昵称，无昵称显示 IP）
+  // 恢复顺序：上次记住的目标 → 当前值 → 本机；设置后立即固化到 localStorage
   function renderTargetSel() {
     var prev = targetSel.value; // 尽量保持原选择，避免重渲染后跳回本机
     targetSel.textContent = '';
@@ -558,7 +566,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       o.textContent = s.label || s.host;
       targetSel.appendChild(o);
     });
-    if (prev && (prev === 'local' || serverById(prev))) targetSel.value = prev;
+    var keep =
+      (savedTarget() || (prev && (prev === 'local' || serverById(prev)) && prev) || 'local');
+    targetSel.value = keep;
+    saveJson(TARGET_KEY, targetSel.value); // 固化实际生效的选择
   }
 
   // =============== 服务器配置管理 ===============
@@ -1057,7 +1068,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // =============== 初始化 ===============
-  targetSel.addEventListener('change', renderGrid); // 切目标即按目标过滤历史
+  // 用户切换目标：记住选择（localStorage）并按该目标过滤历史
+  targetSel.addEventListener('change', function () {
+    saveJson(TARGET_KEY, targetSel.value);
+    renderGrid();
+  });
   renderTargetSel();
   refreshHistory();
 })();
