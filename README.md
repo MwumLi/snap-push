@@ -35,8 +35,8 @@ node snap-push/server.mjs
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Listen address (loopback only by default) |
-| `PORT` | `8123` | Listen port |
+| `SNAP_PUSH_HOST` | `127.0.0.1` | Listen address (loopback only by default) |
+| `SNAP_PUSH_PORT` | `8123` | Listen port |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
 
 ## Usage

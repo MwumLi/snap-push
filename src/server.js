@@ -1314,11 +1314,11 @@ export function createServer(options = {}) {
 }
 
 /**
- * 读取环境变量并启动服务（HOST / PORT / SNAP_PUSH_DIR）。
+ * 读取环境变量并启动服务（SNAP_PUSH_HOST / SNAP_PUSH_PORT / SNAP_PUSH_DIR）。
  */
 export function start() {
-  const host = process.env.HOST || DEFAULT_HOST;
-  const port = Number(process.env.PORT) || DEFAULT_PORT;
+  const host = process.env.SNAP_PUSH_HOST || DEFAULT_HOST;
+  const port = Number(process.env.SNAP_PUSH_PORT) || DEFAULT_PORT;
   const server = createServer();
   server.listen(port, host, () => {
     console.log(`snap-push 已启动：http://${host}:${port}`);
