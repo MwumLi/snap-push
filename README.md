@@ -11,7 +11,7 @@ Zero-dependency screenshot push service. Paste / drag & drop / pick an image in 
 ### Option A — run directly via curl (no file saved)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js \
+curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/src/server.js \
   | node --input-type=module
 ```
 
@@ -20,11 +20,11 @@ Open <http://127.0.0.1:8123>. Press `Ctrl+C` to stop.
 ### Option B — download the single file, then run
 
 ```bash
-curl -fsSL -o snap-push/server.mjs https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js
+curl -fsSL -o snap-push/server.mjs https://raw.githubusercontent.com/MwumLi/snap-push/main/src/server.js
 node snap-push/server.mjs
 ```
 
-> Saved as `.mjs` so Node treats it as an ES module — a single file works without `package.json`. Or just `git clone` the repo and run `node server.js`.
+> Saved as `.mjs` so Node treats it as an ES module — a single file works without `package.json`. Or just `git clone` the repo and run `node src/server.js`.
 
 ## Prerequisites
 
@@ -61,6 +61,6 @@ node snap-push/server.mjs
 ## Development
 
 ```bash
-node --check server.js   # syntax check
+node --check src/server.js   # syntax check
 node --test test/        # run all tests
 ```

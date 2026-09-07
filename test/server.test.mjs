@@ -24,7 +24,7 @@ import {
   buildProbeScript,
   run,
   syncToRemote,
-} from '../server.js';
+} from '../src/server.js';
 
 const HEX32 = 'd41d8cd98f00b204e9800998ecf8427e'; // 合法的 32 位小写 hex 样例（md5("")）
 

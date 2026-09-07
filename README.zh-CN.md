@@ -11,7 +11,7 @@
 ### 方式 A —— curl 直接运行（不保存文件）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js \
+curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/src/server.js \
   | node --input-type=module
 ```
 
@@ -20,11 +20,11 @@ curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js \
 ### 方式 B —— 下载成单文件后运行
 
 ```bash
-curl -fsSL -o snap-push/server.mjs https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js
+curl -fsSL -o snap-push/server.mjs https://raw.githubusercontent.com/MwumLi/snap-push/main/src/server.js
 node snap-push/server.mjs
 ```
 
-> 存为 `.mjs` 让 Node 按 ES 模块解析——单文件无需 `package.json` 即可运行。也可以直接 `git clone` 仓库后执行 `node server.js`。
+> 存为 `.mjs` 让 Node 按 ES 模块解析——单文件无需 `package.json` 即可运行。也可以直接 `git clone` 仓库后执行 `node src/server.js`。
 
 ## 前置条件
 
@@ -61,6 +61,6 @@ node snap-push/server.mjs
 ## 开发
 
 ```bash
-node --check server.js   # 语法检查
+node --check src/server.js   # 语法检查
 node --test test/        # 运行全部测试
 ```
