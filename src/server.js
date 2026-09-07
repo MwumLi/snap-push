@@ -10,6 +10,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -103,6 +104,34 @@ const MIME_BY_EXT = new Map([
 export function mimeOf(name) {
   const ext = /\.([A-Za-z0-9]+)$/.exec(name);
   return (ext && MIME_BY_EXT.get(ext[1].toLowerCase())) || 'application/octet-stream';
+}
+
+// =====================================================================
+// 一·五、实例服务 ID：区分「都是 localhost 却指向不同机器」的场景
+// =====================================================================
+
+/**
+ * 计算本机 snap-push 实例的唯一服务 ID：
+ * 以主机名 + 主 IPv4 为基础生成，同一台机器每次启动结果稳定；
+ * 短 hash 用作 localStorage 键的命名空间，页面展示用可读的 hostname@ip。
+ * 典型场景：同一浏览器先后经 ssh -L 指向不同机器的 snap-push，
+ * 地址都是 127.0.0.1:8123（同源），靠该 ID 才能区分是哪一台实例。
+ */
+export function computeServiceId() {
+  const hostname = os.hostname();
+  // 收集所有非回环 IPv4 并排序，取第一个作为“主地址”；找不到则回退回环地址
+  const ips = [];
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const it of ifaces[name]) {
+      if (it.family === 'IPv4' && !it.internal) ips.push(it.address);
+    }
+  }
+  ips.sort();
+  const ip = ips[0] || '127.0.0.1';
+  // 短 hash 稳定标识本实例：主机名与地址任一变化都会得到不同 hash
+  const hash = crypto.createHash('sha256').update(`${hostname}|${ip}`).digest('hex').slice(0, 8);
+  return { hostname, ip, label: `${hostname}@${ip}`, hash };
 }
 
 // =====================================================================
@@ -280,6 +309,7 @@ function sendJson(res, status, obj) {
  *           （页面 JS 一律普通引号拼接），也不出现 ${ 序列，避免两层语法互扰。
  */
 function sendIndexPage(res) {
+  const svc = computeServiceId(); // 本实例标识：注入 data-* 供页面做展示与存储键命名空间
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -293,6 +323,8 @@ body { margin: 0; background: #f6f8fa; color: #1f2328; font-family: system-ui, -
 header { background: #fff; border-bottom: 1px solid #d0d7de; }
 .header-inner { max-width: 1100px; margin: 0 auto; padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 h1 { font-size: 18px; margin: 0 4px 0 0; }
+#svcBadge { font-size: 12px; color: #57606a; background: #f0f2f4; border: 1px solid #d0d7de; border-radius: 10px; padding: 1px 8px; white-space: nowrap; }
+#svcBadge code { background: none; padding: 0; font-size: 11px; color: #8250df; }
 main { max-width: 1100px; margin: 0 auto; padding: 16px; }
 section { margin-bottom: 22px; }
 h2 { font-size: 15px; margin: 0 0 10px; }
@@ -350,10 +382,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .empty { color: #8b949e; }
 </style>
 </head>
-<body>
+<body data-svc="${svc.hash}" data-svc-label="${svc.label}">
 <header>
   <div class="header-inner">
     <h1>snap-push</h1>
+    <span id="svcBadge" title="本机服务实例（hostname@ip，短 hash 用于区分同源 localhost）"></span>
     <label for="targetSel">目标</label>
     <select id="targetSel"></select>
     <button type="button" id="manageBtn">⚙ 管理</button>
@@ -402,9 +435,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // =============== localStorage 封装 ===============
   // 读取失败（未存过/内容损坏/隐私模式禁用）时静默回退默认值；
   // 写入失败只是不持久化，都不阻断页面功能。
-  var SERVERS_KEY = 'snap-push.servers';
-  var HISTORY_KEY = 'snap-push.history';
-  var TARGET_KEY = 'snap-push.target'; // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
+  //
+  // 存储键按「本实例服务 ID」命名空间隔离：同一浏览器经 ssh -L 先后指向
+  // 不同机器的 snap-push 时，地址都是 127.0.0.1:8123（同源），各实例的
+  // 配置/历史/目标记忆互不串扰；data-svc 缺失（旧缓存页面）则回退旧键名。
+  var svcHash = (document.body && document.body.getAttribute('data-svc')) || '';
+  function storageKey(base) {
+    return svcHash ? 'snap-push@' + svcHash + '.' + base : 'snap-push.' + base;
+  }
+  var SERVERS_KEY = storageKey('servers');
+  var HISTORY_KEY = storageKey('history');
+  var TARGET_KEY = storageKey('target'); // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
 
   function loadJson(key, fallback) {
     try {
@@ -424,6 +465,24 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
+  // 一次性迁移：升级到「按实例命名空间」之前，旧键（snap-push.*）里可能存有
+  // 配置/历史/目标。仅当本实例命名空间尚无数据时，把旧键数据复制过去（只复制不删除，安全）。
+  function legacyKey(base) { return 'snap-push.' + base; }
+  function migrateLegacy() {
+    if (!svcHash) return; // 旧缓存页面本身就在用旧键，无需迁移
+    ['servers', 'history', 'target'].forEach(function (base) {
+      var ns = storageKey(base);
+      if (loadJson(ns, null) !== null) return; // 命名空间已有数据，不覆盖
+      var raw = null;
+      try { raw = localStorage.getItem(legacyKey(base)); } catch (e) { /* 忽略 */ }
+      if (raw === null) return; // 旧键也没数据
+      try { localStorage.setItem(ns, raw); } catch (e) {
+        console.warn('迁移旧数据 ' + legacyKey(base) + ' 失败：', e);
+      }
+    });
+  }
+  migrateLegacy();
+
   // =============== 页面状态 ===============
   var servers = loadJson(SERVERS_KEY, []); // [{id,label,host,user,dir,urlBase}]
   if (!Array.isArray(servers)) servers = [];
@@ -435,6 +494,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // =============== DOM 引用 ===============
   var targetSel = document.getElementById('targetSel');
   var manageBtn = document.getElementById('manageBtn');
+  var svcBadge = document.getElementById('svcBadge');
   var managePanel = document.getElementById('managePanel');
   var serverList = document.getElementById('serverList');
   var serverForm = document.getElementById('serverForm');
@@ -452,6 +512,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var msg = document.getElementById('msg');
   var grid = document.getElementById('grid');
   var historyCount = document.getElementById('historyCount');
+
+  // 展示本实例标识（hostname@ip + 短 hash），帮助识别当前 localhost 指向哪台机器
+  if (svcBadge) {
+    var svcLabel = (document.body && document.body.getAttribute('data-svc-label')) || '';
+    svcBadge.textContent = svcLabel ? svcLabel + '  ' : '';
+    if (svcHash) {
+      var svcCode = document.createElement('code');
+      svcCode.textContent = '#' + svcHash;
+      svcBadge.appendChild(svcCode);
+    }
+  }
 
   // =============== 通用小工具 ===============
 
@@ -1275,7 +1346,8 @@ async function route(req, res, ctx) {
   const { pathname, searchParams } = url;
 
   if (req.method === 'GET' && pathname === '/health') {
-    return sendJson(res, 200, { ok: true });
+    // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器
+    return sendJson(res, 200, { ok: true, id: computeServiceId() });
   }
   if (req.method === 'GET' && pathname === '/') {
     return sendIndexPage(res);

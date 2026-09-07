@@ -20,6 +20,7 @@ import {
   validateUser,
   validateDir,
   isValidStoredName,
+  computeServiceId,
   mimeOf,
   buildProbeScript,
   run,
@@ -198,6 +199,20 @@ describe('纯函数：mimeOf', () => {
   });
 });
 
+describe('实例服务 ID：computeServiceId', () => {
+  test('字段齐全、hash 为 8 位 hex、两次调用稳定', () => {
+    const a = computeServiceId();
+    const b = computeServiceId();
+    // hostname 必须与本机一致；ip 为合法 IPv4 或回退回环
+    assert.equal(a.hostname, os.hostname());
+    assert.ok(/^(\d{1,3}\.){3}\d{1,3}$/.test(a.ip), `ip 应为 IPv4：${a.ip}`);
+    assert.equal(a.label, `${a.hostname}@${a.ip}`);
+    assert.ok(/^[0-9a-f]{8}$/.test(a.hash), `hash 应为 8 位 hex：${a.hash}`);
+    // 同机同一次运行结果必须稳定
+    assert.deepEqual(b, a);
+  });
+});
+
 describe('纯函数：buildProbeScript（妙传探测脚本）', () => {
   test('探测脚本包含 md5 内容比对（快照断言）', () => {
     // 文件名前 32 位 hex 即内容 md5：同名必须同内容才算已存在，防残缺文件被误判
@@ -287,11 +302,16 @@ describe('HTTP 基础接口', () => {
     await stopServer(server);
   });
 
-  test('GET /health → 200 {"ok":true}', async () => {
+  test('GET /health → 200 {ok,id}', async () => {
     const res = await fetch(`${base}/health`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
-    assert.deepEqual(await res.json(), { ok: true });
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    // 实例标识形状校验（值随机器变化，只验证结构）
+    assert.equal(typeof body.id, 'object');
+    assert.ok(body.id.hostname && body.id.ip && body.id.label, 'id 缺少 hostname/ip/label');
+    assert.ok(/^[0-9a-f]{8}$/.test(body.id.hash), `hash 应为 8 位 hex：${body.id.hash}`);
   });
 
   test('GET / → 200 占位 HTML（含 snap-push）', async () => {

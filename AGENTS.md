@@ -8,7 +8,7 @@ snap-push 是本地零依赖的截图推送服务：浏览器选图/粘贴上传
    - `src/server.js` 仅允许使用 Node 标准库（node:http、node:crypto、node:child_process、node:fs 等），禁止引入任何 npm 第三方依赖。
    - 页面（HTML/CSS/JS）必须内嵌于 server.js，不依赖任何外部资源/CDN/静态文件。
    - 目标是「存在 Node 运行时即可运行」：保持 `node src/server.js`（或 curl 管道）开箱即用，无需安装步骤。
-   - 改动后必须保证 `node --check src/server.js` 与 `node --test test/`（现有 44 用例）通过。
+   - 改动后必须保证 `node --check src/server.js` 与 `node --test test/`（现有 45 用例）全部通过。
 
 2. **README 中英文必须同步更新**
    - 仓库文档双版维护：`README.md`（英文）与 `README.zh-CN.md`（中文）。
