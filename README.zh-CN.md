@@ -64,3 +64,7 @@ node snap-push/server.mjs
 node --check src/server.js   # 语法检查
 node --test test/        # 运行全部测试
 ```
+
+## 开源协议
+
+[MIT](./LICENSE) © 2026 MwumLi

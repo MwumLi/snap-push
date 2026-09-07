@@ -64,3 +64,7 @@ node snap-push/server.mjs
 node --check src/server.js   # syntax check
 node --test test/        # run all tests
 ```
+
+## License
+
+[MIT](./LICENSE) © 2026 MwumLi
