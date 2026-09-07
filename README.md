@@ -1,52 +1,66 @@
 # snap-push
 
-本地零依赖的截图推送服务：浏览器粘贴/拖拽/选图，一键推送到本机或任意 ssh 免密的服务器，立刻拿到远端文件路径（可选 URL）。
+> 中文版：[README.zh-CN.md](./README.zh-CN.md)
 
-**典型场景**：在服务器上跑 opencode 等 AI 编码工具时，把本地截图快速传上去——不用再手敲 `scp` 命令，Ctrl+V 粘贴即得服务器路径，复制即可引用。
+Zero-dependency screenshot push service. Paste / drag & drop / pick an image in a local web page, push it to your local machine or any SSH passwordless server in one click, and instantly get a copy-ready remote path (optional URL).
 
-## 快速开始
+**Typical scenario**: running an AI coding tool like opencode on a remote server? Snap local screenshots up in seconds — no more typing `scp` by hand. Ctrl+V and copy the server path to use it right away.
+
+## Quick Start
+
+### Option A — run directly via curl (no file saved)
 
 ```bash
-node server.js
+curl -fsSL https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js \
+  | node --input-type=module
 ```
 
-浏览器打开 <http://127.0.0.1:8123> 即可使用。
+Open <http://127.0.0.1:8123>. Press `Ctrl+C` to stop.
 
-## 前置条件
-
-- Node.js ≥ 18（仅用标准库，零 npm 依赖）
-- 推送到服务器需先配置好该机器的 **ssh 免密登录**（`ssh-copy-id user@host`）
-
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `HOST` | `127.0.0.1` | 监听地址（默认仅本机回环） |
-| `PORT` | `8123` | 监听端口 |
-| `SNAP_PUSH_DIR` | `/tmp/snap-push` | 本机图片落盘目录（页面预览/图库用） |
-
-## 使用说明
-
-1. **默认目标是本机**：不上传远端，图片落盘本机 `SNAP_PUSH_DIR`，页面直接给出绝对路径。
-2. **推送到服务器**：点顶部「⚙ 管理」添加配置——昵称（可选）、IP、用户名（默认 `root`）、远端目录（默认 `/tmp/snap-push`）、静态 URL 前缀（可选）。之后顶部下拉切换目标即可。
-3. **上传**三种方式任选：点击选择图片、拖拽进上传区、截图后 `Ctrl+V` 直接粘贴。上传完成页面给出远端路径（配了 URL 前缀则同时给 URL），一键复制。
-4. **历史图库**：严格按当前所选目标过滤——选中某服务器只显示已推到那台的图，本机视图显示全部。
-
-## 传输机制
-
-- **rsync 优先，scp 兜底**：远端装了 rsync 就走 `rsync -az` 增量传输；远端没有 rsync 时自动降级为 `scp` 直传。
-- **文件命名 `<md5>-<原名>`**：内容相同即同名，天然去重。
-- **同内容妙传**：上传前用一条 ssh 比对远端文件 md5，同内容直接跳过传输（`method: skip`，秒回）。若远端同名文件内容不符（如残缺残留），会判定为缺失并重新上传修复（自愈）。
-
-## 常见问题
-
-- **报「ssh 探测失败」**：目标机器免密未配置或网络不通，先手动 `ssh user@host` 验证能否免密登录。
-- **远端没装 rsync**：无需处理，自动用 scp 兜底，上传结果会标注 `scp`。
-- **本地目录（`SNAP_PUSH_DIR`）的作用**：存预览图与图库记录，供页面显示缩略图；妙传判断只看远端，与本地保存无关。
-
-## 开发
+### Option B — download the single file, then run
 
 ```bash
-node --check server.js   # 语法检查
-node --test test/        # 运行全部测试
+curl -fsSL -o snap-push/server.mjs https://raw.githubusercontent.com/MwumLi/snap-push/main/server.js
+node snap-push/server.mjs
+```
+
+> Saved as `.mjs` so Node treats it as an ES module — a single file works without `package.json`. Or just `git clone` the repo and run `node server.js`.
+
+## Prerequisites
+
+- Node.js ≥ 18 (standard library only, zero npm dependencies)
+- To push to a server: set up **passwordless SSH** to that machine first (`ssh-copy-id user@host`)
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Listen address (loopback only by default) |
+| `PORT` | `8123` | Listen port |
+| `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
+
+## Usage
+
+1. **Default target is the local machine**: no remote upload — images land in the local `SNAP_PUSH_DIR`, and the page shows the absolute path.
+2. **Push to a server**: click **⚙ Manage** to add a config — nickname (optional), IP, username (default `root`), remote dir (default `/tmp/snap-push`), static URL prefix (optional). Then switch targets from the top dropdown.
+3. **Upload** any of three ways: click to pick images, drag & drop into the upload area, or screenshot and paste with `Ctrl+V`. On success the page shows the remote path (plus URL if a prefix is configured) — copy in one click.
+4. **History library** is strictly filtered by the current target: picking a server shows only images pushed to it; the local view shows everything.
+
+## Transfer Mechanism
+
+- **rsync first, scp fallback**: if the remote has rsync it transfers with `rsync -az`; otherwise it automatically degrades to `scp`.
+- **Naming `<md5>-<original>`**: identical content → identical name → natural dedup.
+- **Instant re-upload**: before uploading, a single ssh call compares the remote file's md5. If the content already exists it skips the transfer (`method: skip`, instant). If the same-named remote file has mismatched content (e.g. a leftover partial file), it is treated as missing and re-uploaded to repair it (self-healing).
+
+## FAQ
+
+- **"ssh probe failed"**: passwordless login to the target isn't set up, or the host is unreachable. First verify with `ssh user@host` manually.
+- **Remote has no rsync**: nothing to do — it falls back to scp automatically, and the result is labeled `scp`.
+- **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails. Instant-skip logic only looks at the remote — it is independent of local storage.
+
+## Development
+
+```bash
+node --check server.js   # syntax check
+node --test test/        # run all tests
 ```
