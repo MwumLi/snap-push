@@ -39,6 +39,12 @@ node snap-push/server.mjs
 | `SNAP_PUSH_PORT` | `8123` | Listen port |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
 
+> **On `SNAP_PUSH_HOST`**: keep the default `127.0.0.1`. This tool has **no authentication** — it is meant for local dev convenience, and exposing it to a network is unsafe (and not planned). To reach it from another machine, run snap-push on your dev host bound to loopback and forward the port over SSH, then open <http://127.0.0.1:8123> locally:
+>
+> ```bash
+> ssh -N -L 8123:127.0.0.1:8123 user@dev-host
+> ```
+
 ## Usage
 
 1. **Default target is the local machine**: no remote upload — images land in the local `SNAP_PUSH_DIR`, and the page shows the absolute path.
