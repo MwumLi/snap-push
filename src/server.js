@@ -413,7 +413,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .up-row.up-fail .up-status { color: #cf222e; }
 .msg { min-height: 18px; font-size: 13px; color: #57606a; margin: 8px 0 0; }
 .msg.error { color: #cf222e; }
-#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
 .card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
 .thumb { display: flex; align-items: center; justify-content: center; height: 150px; background: #f0f2f4; }
 .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
