@@ -323,6 +323,81 @@ describe('syncToRemote 失败分支', () => {
 });
 
 // =====================================================================
+// 三·五、HTTP 集成：POST /sync（从图库补齐）
+// =====================================================================
+
+describe('POST /sync（从图库补齐接口）', () => {
+  let server;
+  let base;
+  let snapDir;
+
+  before(async () => {
+    snapDir = path.join(tmpRoot, 'sync');
+    ({ server, base } = await startServer({ snapDir }));
+  });
+
+  after(async () => {
+    await stopServer(server);
+  });
+
+  // 先本机落盘一张图，返回其 localName（/sync 复用图库已有文件）
+  async function seedLocal(orig) {
+    const res = await upload(base, { name: orig }, crypto.randomBytes(16));
+    assert.equal(res.status, 200);
+    return (await res.json()).localName;
+  }
+
+  test('缺 name / name 不合法 → 400', async () => {
+    // 缺 name
+    let r = await fetch(`${base}/sync?host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+    // 非 <md5>- 前缀（含路径穿越串）→ 400
+    r = await fetch(`${base}/sync?name=evil%2F..%2Fx.png&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+    r = await fetch(`${base}/sync?name=x.png&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+  });
+
+  test('host 缺失/非法、dir 缺失 → 400', async () => {
+    const localName = await seedLocal('a.png');
+    // host 缺失
+    let r = await fetch(`${base}/sync?name=${encodeURIComponent(localName)}&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+    // host 非法字符
+    r = await fetch(`${base}/sync?name=${encodeURIComponent(localName)}&host=bad%20host&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+    // dir 缺失
+    r = await fetch(`${base}/sync?name=${encodeURIComponent(localName)}&host=127.0.0.1`, { method: 'POST' });
+    assert.equal(r.status, 400);
+  });
+
+  test('合法名但图库中不存在该文件 → 404', async () => {
+    const r = await fetch(
+      `${base}/sync?name=${HEX32}-ghost.png&host=127.0.0.1&user=root&dir=/tmp/x`,
+      { method: 'POST' },
+    );
+    assert.equal(r.status, 404);
+    const body = await r.json();
+    assert.equal(body.ok, false);
+  });
+
+  test('目标不可达 → 500 中文错误，服务不崩', async () => {
+    const localName = await seedLocal('b.png');
+    const r = await fetch(
+      `${base}/sync?name=${encodeURIComponent(localName)}&host=127.0.0.256&user=root&dir=/tmp/x`,
+      { method: 'POST' },
+    );
+    assert.equal(r.status, 500);
+    const body = await r.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ssh/);
+    // 服务仍可用
+    const health = await fetch(`${base}/health`);
+    assert.equal(health.status, 200);
+  });
+});
+
+// =====================================================================
 // 四、HTTP 集成：基础接口（共享一个测试实例）
 // =====================================================================
 

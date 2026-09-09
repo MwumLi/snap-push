@@ -430,6 +430,32 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .target-none { color: #8b949e; }
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
+
+/* —— 历史区双栏布局：左侧图库网格 + 右侧「从图库补齐」抽屉（参与布局、不遮挡） —— */
+.hist-area { display: flex; gap: 14px; align-items: flex-start; }
+#grid { flex: 1; min-width: 0; } /* 抽屉展开挤压宽度时，卡片由 auto-fill 自动换行 */
+#syncDrawer {
+  width: 300px; flex: 0 0 300px;
+  display: flex; flex-direction: column;
+  max-height: calc(100vh - 220px); /* 封顶：避免右侧面板高度撑出视口 */
+  position: sticky; top: 16px;     /* 页面滚动时右栏跟随，列表内部滚动 */
+  background: #fff; border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
+}
+#syncDrawer[hidden] { display: none; }
+.drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid #f0f2f4; }
+.drawer-head strong { font-size: 13px; word-break: break-all; }
+#syncClose { font-size: 15px; line-height: 1; padding: 1px 8px; }
+.drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px; }
+.sync-empty { color: #8b949e; font-size: 12px; text-align: center; padding: 14px 6px; }
+.sync-item { display: flex; gap: 8px; align-items: center; padding: 5px 4px; border-bottom: 1px solid #f0f2f4; }
+.sync-item:last-child { border-bottom: none; }
+.sync-item img { width: 40px; height: 40px; object-fit: contain; background: #f0f2f4; border-radius: 4px; flex: 0 0 auto; cursor: zoom-in; }
+.sync-name { flex: 1; min-width: 0; font-size: 12px; word-break: break-all; line-height: 1.3; cursor: pointer; color: #1f2328; }
+.sync-name:hover { color: #0969da; }
+.sync-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; flex: 0 0 auto; }
+.sync-actions .sync-err { color: #cf222e; font-size: 11px; max-width: 140px; word-break: break-all; }
+.drawer-foot { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 8px 10px; border-top: 1px solid #f0f2f4; }
+.drawer-foot .sync-progress { color: #57606a; font-size: 12px; }
 </style>
 </head>
 <body data-svc="${svc.hash}" data-svc-label="${svc.label}">
@@ -439,6 +465,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <span id="svcBadge" title="本机服务实例（hostname@ip，短 hash 用于区分同源 localhost）"></span>
     <label for="targetSel">目标</label>
     <select id="targetSel"></select>
+    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
     <button type="button" id="manageBtn">⚙ 管理</button>
   </div>
 </header>
@@ -472,10 +499,23 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <p class="msg" id="msg"></p>
   </section>
 
-  <!-- 历史区：按当前目标过滤 -->
+  <!-- 历史区：按当前目标过滤；右侧抽屉（从图库补齐）参与布局，不遮挡左侧 -->
   <section>
     <h2>历史图库 <span class="count" id="historyCount"></span></h2>
-    <div id="grid"></div>
+    <div class="hist-area">
+      <div id="grid"></div>
+      <aside id="syncDrawer" hidden>
+        <header class="drawer-head">
+          <strong id="syncTitle">补齐到…</strong>
+          <button type="button" id="syncClose" title="关闭">×</button>
+        </header>
+        <div id="syncList" class="drawer-list"></div>
+        <footer class="drawer-foot">
+          <button type="button" id="syncSelAll">全选</button>
+          <button type="button" id="syncSelBtn" disabled>同步选中(0)</button>
+        </footer>
+      </aside>
+    </div>
   </section>
 </main>
 <script>
@@ -540,6 +580,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var history = loadJson(HISTORY_KEY, {});
   if (typeof history !== 'object' || history === null || Array.isArray(history)) history = {};
   var libFiles = []; // 最近一次 GET /api/library 的文件清单
+  var syncSelected = {}; // 「从图库补齐」抽屉的勾选集合：localName -> true
+  var syncBusy = false; // 同步进行中：期间禁用勾选/按钮，避免交叉
 
   // =============== DOM 引用 ===============
   var targetSel = document.getElementById('targetSel');
@@ -562,6 +604,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var msg = document.getElementById('msg');
   var grid = document.getElementById('grid');
   var historyCount = document.getElementById('historyCount');
+  var syncLibBtn = document.getElementById('syncLibBtn');
+  var syncDrawer = document.getElementById('syncDrawer');
+  var syncTitle = document.getElementById('syncTitle');
+  var syncList = document.getElementById('syncList');
+  var syncClose = document.getElementById('syncClose');
+  var syncSelAll = document.getElementById('syncSelAll');
+  var syncSelBtn = document.getElementById('syncSelBtn');
 
   // 展示本实例标识（hostname@ip + 短 hash），帮助识别当前 localhost 指向哪台机器
   if (svcBadge) {
@@ -1065,6 +1114,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     files.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
+    refreshSyncArea(); // 图库/目标变化后，同步「从图库补齐」按钮与抽屉状态
+  }
+
+  // 「从图库补齐」联动：按钮可用性随是否选中服务器变化；抽屉开着时同步刷新列表
+  function refreshSyncArea() {
+    var srv = currentServer();
+    syncLibBtn.disabled = !srv || syncBusy;
+    if (!srv) {
+      if (!syncDrawer.hidden) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
+      return;
+    }
+    if (!syncDrawer.hidden) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
   }
 
   function makeCard(f, srv) {
@@ -1187,6 +1248,230 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       window.alert('删除失败：' + (err.message || err));
     }
   }
+
+  // =============== 从图库补齐抽屉 ===============
+  // 把「本地图库有、但还没推到当前目标」的图补推过去（POST /sync，免重传字节）。
+  // 抽屉参与布局不遮挡左侧；仅点 × 关闭（不点空白关闭，避免误触）。
+
+  // 取展示用原名：优先历史记录；否则从存储名 <md5>-原名 第 34 位起截取
+  function origOf(name) {
+    var entry = history[name];
+    if (entry && entry.orig) return entry.orig;
+    return name.length > 33 ? name.slice(33) : name;
+  }
+
+  // 该图是否已推送到目标 srv（按 host+dir 判定，与左栏过滤规则一致）
+  function isOnTarget(name, srv) {
+    if (!srv) return true;
+    var rec = history[name];
+    if (!rec || !Array.isArray(rec.targets)) return false;
+    return rec.targets.some(function (t) { return t.host === srv.host && t.dir === srv.dir; });
+  }
+
+  // 组装 /sync 的 query
+  function syncQuery(srv, name) {
+    var p = new URLSearchParams();
+    p.set('name', name);
+    p.set('host', srv.host);
+    p.set('user', srv.user || 'root');
+    p.set('dir', srv.dir);
+    if (srv.urlBase) p.set('urlBase', srv.urlBase);
+    return p;
+  }
+
+  // 单文件补齐核心：POST /sync，成功写历史并返回 data；失败抛中文错误
+  async function doSyncOne(name, srv) {
+    var res;
+    try {
+      res = await fetch('/sync?' + syncQuery(srv, name).toString(), { method: 'POST' });
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    var jsonOk = true;
+    try { data = await res.json(); } catch (e) { jsonOk = false; }
+    if (!res.ok || !jsonOk || !data.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
+    }
+    recordUpload(data, origOf(name), srv);
+    return data;
+  }
+
+  // 当前勾选数量
+  function selectedSyncCount() {
+    var n = 0;
+    for (var k in syncSelected) { if (syncSelected[k]) n++; }
+    return n;
+  }
+
+  function updateSyncSelBtn() {
+    var n = selectedSyncCount();
+    syncSelBtn.disabled = n === 0 || syncBusy;
+    syncSelBtn.textContent = '同步选中(' + n + ')';
+  }
+
+  // 单行推送（行内按钮）
+  async function syncOneRow(name, f, btn, errEl) {
+    if (syncBusy) return;
+    var srv = currentServer();
+    if (!srv) return;
+    btn.disabled = true;
+    btn.textContent = '同步中…';
+    if (errEl) errEl.textContent = '';
+    try {
+      await doSyncOne(name, srv);
+      delete syncSelected[name];
+      renderGrid(); // 左栏刷新（renderGrid 内部会联动重绘抽屉，本行自然消失）
+      hint('已推送到 ' + (srv.label || srv.host));
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '推送';
+      var msgText = e.message || String(e);
+      if (errEl) errEl.textContent = msgText;
+      hint(msgText, true);
+    }
+  }
+
+  // 构建一行「缺项」：勾选框 + 缩略图/名（点开原图）+ 推送按钮 + 错误位
+  function buildSyncRow(f, srv) {
+    var row = document.createElement('div');
+    row.className = 'sync-item';
+
+    var check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = !!syncSelected[f.name];
+    check.disabled = syncBusy;
+    check.addEventListener('change', function () {
+      if (syncBusy) { check.checked = !check.checked; return; }
+      if (check.checked) syncSelected[f.name] = true;
+      else delete syncSelected[f.name];
+      updateSyncSelBtn();
+    });
+    row.appendChild(check);
+
+    var href = '/files/' + encodeURIComponent(f.name);
+    var img = document.createElement('img');
+    img.src = href;
+    img.alt = f.name;
+    img.title = '点击查看原图';
+    var aImg = document.createElement('a');
+    aImg.href = href;
+    aImg.target = '_blank';
+    aImg.rel = 'noopener';
+    aImg.appendChild(img);
+    row.appendChild(aImg);
+
+    var nm = document.createElement('a');
+    nm.className = 'sync-name';
+    nm.href = href;
+    nm.target = '_blank';
+    nm.rel = 'noopener';
+    nm.textContent = origOf(f.name);
+    nm.title = origOf(f.name);
+    row.appendChild(nm);
+
+    var act = document.createElement('span');
+    act.className = 'sync-actions';
+    var errEl = document.createElement('span');
+    errEl.className = 'sync-err';
+    act.appendChild(errEl);
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '推送';
+    btn.addEventListener('click', function () { syncOneRow(f.name, f, btn, errEl); });
+    act.appendChild(btn);
+    row.appendChild(act);
+
+    return row;
+  }
+
+  // 重绘抽屉列表（缺项集 = 图库 − 已推到当前目标）
+  function renderSyncList() {
+    var srv = currentServer();
+    syncTitle.textContent = srv ? '补齐到 ' + (srv.label || srv.host) : '补齐到…';
+    syncList.textContent = '';
+    if (!srv) return;
+    var missing = libFiles.filter(function (f) { return !isOnTarget(f.name, srv); });
+    if (!missing.length) {
+      var empty = document.createElement('p');
+      empty.className = 'sync-empty';
+      empty.textContent = '图库中所有图片都已同步到该目标';
+      syncList.appendChild(empty);
+      syncSelAll.textContent = '全选';
+      syncSelAll.disabled = true;
+      updateSyncSelBtn();
+      return;
+    }
+    missing.forEach(function (f) { syncList.appendChild(buildSyncRow(f, srv)); });
+    // 全选按钮文案：全部已勾选 → 显示“取消全选”
+    var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
+    syncSelAll.textContent = allChecked ? '取消全选' : '全选';
+    syncSelAll.disabled = syncBusy;
+    updateSyncSelBtn();
+  }
+
+  // 打开抽屉（仅当已选服务器目标；本机无意义）
+  function openDrawer() {
+    var srv = currentServer();
+    if (!srv) { hint('请先选择目标服务器，再从图库补齐', true); return; }
+    syncSelected = {};
+    syncDrawer.hidden = false;
+    renderSyncList();
+  }
+
+  function closeDrawer() {
+    syncDrawer.hidden = true;
+    syncSelected = {};
+  }
+
+  // 全选/取消全选：作用域是「当前缺项集」
+  syncSelAll.addEventListener('click', function () {
+    var srv = currentServer();
+    if (!srv || syncBusy) return;
+    var missing = libFiles.filter(function (f) { return !isOnTarget(f.name, srv); });
+    if (!missing.length) return;
+    var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
+    missing.forEach(function (f) {
+      if (allChecked) delete syncSelected[f.name];
+      else syncSelected[f.name] = true;
+    });
+    renderSyncList();
+  });
+
+  // 批量同步选中：串行逐张，期间锁定控件
+  syncSelBtn.addEventListener('click', async function () {
+    var srv = currentServer();
+    if (!srv || syncBusy) return;
+    var pending = [];
+    for (var k in syncSelected) { if (syncSelected[k]) pending.push(k); }
+    if (!pending.length) return;
+    syncBusy = true;
+    syncLibBtn.disabled = true;
+    syncSelAll.disabled = true;
+    syncList.style.pointerEvents = 'none'; // 锁定行内交互，防交叉
+    syncSelBtn.textContent = '同步中…';
+    var ok = 0, fail = 0;
+    for (var i = 0; i < pending.length; i++) {
+      syncSelBtn.textContent = '同步中 ' + (i + 1) + '/' + pending.length;
+      try {
+        await doSyncOne(pending[i], srv);
+        delete syncSelected[pending[i]];
+        ok++;
+      } catch (e) {
+        fail++;
+      }
+    }
+    syncBusy = false;
+    syncList.style.pointerEvents = '';
+    syncSelAll.disabled = false;
+    syncLibBtn.disabled = !currentServer();
+    renderGrid();
+    if (fail) hint('补齐完成：成功 ' + ok + ' 张，失败 ' + fail + ' 张', true);
+    else hint('已补齐 ' + ok + ' 张到 ' + (srv.label || srv.host));
+  });
+
+  syncLibBtn.addEventListener('click', openDrawer);
+  syncClose.addEventListener('click', closeDrawer);
 
   // =============== 初始化 ===============
   // 用户切换目标：记住选择（localStorage）并按该目标过滤历史
@@ -1338,6 +1623,71 @@ async function handleUpload(req, res, params, ctx) {
   });
 }
 
+/**
+ * 解析并校验「远端目标」参数（host/user/dir/urlBase）。
+ * 返回 { ok:true, target:{host,user,dir}, urlBase }；
+ * 参数非法时返回 { ok:false, status, error }，由调用方直接回 4xx。
+ */
+function parseTargetParams(params) {
+  const hostRaw = params.get('host') || '';
+  const host = validateHost(hostRaw);
+  if (!host) {
+    return { ok: false, status: 400, error: 'host 缺失或不合法：仅允许字母、数字、点、下划线、连字符' };
+  }
+  const user = validateUser(params.get('user') || 'root'); // 远程用户名缺省 root
+  if (!user) {
+    return { ok: false, status: 400, error: 'user 不合法：仅允许字母、数字、点、下划线、连字符' };
+  }
+  const dirRaw = params.get('dir') || '';
+  if (!dirRaw) {
+    return { ok: false, status: 400, error: 'dir（远端目录）必填' };
+  }
+  const dir = validateDir(dirRaw);
+  if (!dir) {
+    return { ok: false, status: 400, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' };
+  }
+  return { ok: true, target: { host, user, dir }, urlBase: params.get('urlBase') || '' };
+}
+
+/**
+ * POST /sync?name=<localName>&host=&user=&dir=&urlBase=
+ * 把本地图库中已存在的文件直接同步到远端目标（免浏览器重传字节）。
+ * 供页面「从图库补齐」抽屉使用——把「本地有、当前目标没有」的图补推过去；
+ * 本机目标没有意义（host 必填），妙传/rsync/scp 逻辑与 /upload 一致。
+ */
+async function handleSync(req, res, params, ctx) {
+  req.resume(); // /sync 无请求体
+  const name = params.get('name') || '';
+  if (!isValidStoredName(name)) {
+    return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法（须为图库文件名 <md5>-原名）' });
+  }
+  const pt = parseTargetParams(params);
+  if (!pt.ok) {
+    return sendJson(res, pt.status, { ok: false, error: pt.error });
+  }
+  const localPath = path.join(ctx.snapDir, name);
+  let isFile = false;
+  try {
+    isFile = (await fs.promises.stat(localPath)).isFile();
+  } catch (err) {
+    if (err.code === 'ENOENT') return sendJson(res, 404, { ok: false, error: '本机图库中不存在该文件' });
+    throw err;
+  }
+  if (!isFile) return sendJson(res, 404, { ok: false, error: '本机图库中不存在该文件' });
+  // 串行执行远端同步，避免并发 rsync 交叉
+  const result = await ctx.enqueue(async () => {
+    const { method } = await syncToRemote(localPath, name, pt.target);
+    return { method };
+  });
+  return sendJson(res, 200, {
+    ok: true,
+    localName: name,
+    remotePath: `${pt.target.dir}/${name}`,
+    url: pt.urlBase ? `${pt.urlBase}/${name}` : undefined,
+    method: result.method,
+  });
+}
+
 /** GET /api/library：列出本机目录中所有合法存储名文件，按 mtime 降序（新图在前） */
 async function handleLibrary(res, ctx) {
   await ensureDir(ctx.snapDir);
@@ -1404,6 +1754,9 @@ async function route(req, res, ctx) {
   }
   if (req.method === 'POST' && pathname === '/upload') {
     return handleUpload(req, res, searchParams, ctx);
+  }
+  if (req.method === 'POST' && pathname === '/sync') {
+    return handleSync(req, res, searchParams, ctx);
   }
   if (req.method === 'GET' && pathname === '/api/library') {
     return handleLibrary(res, ctx);
