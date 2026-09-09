@@ -445,15 +445,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid #f0f2f4; }
 .drawer-head strong { font-size: 13px; word-break: break-all; }
 #syncClose { font-size: 15px; line-height: 1; padding: 1px 8px; }
-.drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px; }
+.drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
 .sync-empty { color: #8b949e; font-size: 12px; text-align: center; padding: 14px 6px; }
-.sync-item { display: flex; gap: 8px; align-items: center; padding: 5px 4px; border-bottom: 1px solid #f0f2f4; }
-.sync-item:last-child { border-bottom: none; }
-.sync-item img { width: 40px; height: 40px; object-fit: contain; background: #f0f2f4; border-radius: 4px; flex: 0 0 auto; cursor: zoom-in; }
-.sync-name { flex: 1; min-width: 0; font-size: 12px; word-break: break-all; line-height: 1.3; cursor: pointer; color: #1f2328; }
-.sync-name:hover { color: #0969da; }
-.sync-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; flex: 0 0 auto; }
-.sync-actions .sync-err { color: #cf222e; font-size: 11px; max-width: 140px; word-break: break-all; }
+/* 抽屉内缺项 = 历史卡片样式，仅单列铺满抽屉宽 */
+.sync-card { width: 100%; }
+.sync-card .card-ops { justify-content: space-between; align-items: center; margin-top: 2px; }
+.sync-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.sync-err { color: #cf222e; font-size: 11px; word-break: break-all; line-height: 1.4; }
 .drawer-foot { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 8px 10px; border-top: 1px solid #f0f2f4; }
 .drawer-foot .sync-progress { color: #57606a; font-size: 12px; }
 </style>
@@ -1333,11 +1331,55 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 构建一行「缺项」：勾选框 + 缩略图/名（点开原图）+ 推送按钮 + 错误位
-  function buildSyncRow(f, srv) {
-    var row = document.createElement('div');
-    row.className = 'sync-item';
+  // 构建一个「缺项」卡片：展示与历史图库一致（大缩略图 + 原名 + 大小/时间 + 操作行），单列
+  function buildSyncCard(f, srv) {
+    var card = document.createElement('div');
+    card.className = 'card sync-card';
 
+    var href = '/files/' + encodeURIComponent(f.name);
+
+    // 大缩略图：点击新窗口打开原图（同历史卡片）
+    var link = document.createElement('a');
+    link.className = 'thumb';
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    var img = document.createElement('img');
+    img.src = href;
+    img.alt = f.name;
+    img.loading = 'lazy';
+    link.appendChild(img);
+    card.appendChild(link);
+
+    var body = document.createElement('div');
+    body.className = 'card-body';
+
+    // 原名 + 大小/时间：与历史卡一致
+    var origEl = document.createElement('div');
+    origEl.className = 'orig';
+    origEl.textContent = origOf(f.name);
+    body.appendChild(origEl);
+
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = formatSize(f.size) + ' · ' + formatTime(f.mtime);
+    body.appendChild(meta);
+
+    // 状态行：对齐历史卡「该目标记录」语义；此目标还没有记录 → 显示尚未推送
+    var list = document.createElement('div');
+    list.className = 'targets';
+    var none = document.createElement('div');
+    none.className = 'target-none';
+    none.textContent = '尚未推送到 ' + (srv.label || srv.host);
+    list.appendChild(none);
+    body.appendChild(list);
+
+    // 操作行：左侧「勾选」+ 右侧「推送」
+    var ops = document.createElement('div');
+    ops.className = 'card-ops';
+
+    var lab = document.createElement('label');
+    lab.className = 'sync-check';
     var check = document.createElement('input');
     check.type = 'checkbox';
     check.checked = !!syncSelected[f.name];
@@ -1348,42 +1390,24 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       else delete syncSelected[f.name];
       updateSyncSelBtn();
     });
-    row.appendChild(check);
+    lab.appendChild(check);
+    lab.appendChild(document.createTextNode('选择'));
+    ops.appendChild(lab);
 
-    var href = '/files/' + encodeURIComponent(f.name);
-    var img = document.createElement('img');
-    img.src = href;
-    img.alt = f.name;
-    img.title = '点击查看原图';
-    var aImg = document.createElement('a');
-    aImg.href = href;
-    aImg.target = '_blank';
-    aImg.rel = 'noopener';
-    aImg.appendChild(img);
-    row.appendChild(aImg);
-
-    var nm = document.createElement('a');
-    nm.className = 'sync-name';
-    nm.href = href;
-    nm.target = '_blank';
-    nm.rel = 'noopener';
-    nm.textContent = origOf(f.name);
-    nm.title = origOf(f.name);
-    row.appendChild(nm);
-
-    var act = document.createElement('span');
-    act.className = 'sync-actions';
-    var errEl = document.createElement('span');
-    errEl.className = 'sync-err';
-    act.appendChild(errEl);
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '推送';
+    var errEl = document.createElement('span');
+    errEl.className = 'sync-err';
     btn.addEventListener('click', function () { syncOneRow(f.name, f, btn, errEl); });
-    act.appendChild(btn);
-    row.appendChild(act);
+    ops.appendChild(btn);
+    body.appendChild(ops);
 
-    return row;
+    // 失败提示行（成功时留空，整卡由 renderGrid→renderSyncList 移除）
+    body.appendChild(errEl);
+
+    card.appendChild(body);
+    return card;
   }
 
   // 重绘抽屉列表（缺项集 = 图库 − 已推到当前目标）
@@ -1403,7 +1427,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       updateSyncSelBtn();
       return;
     }
-    missing.forEach(function (f) { syncList.appendChild(buildSyncRow(f, srv)); });
+    missing.forEach(function (f) { syncList.appendChild(buildSyncCard(f, srv)); });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     syncSelAll.textContent = allChecked ? '取消全选' : '全选';
