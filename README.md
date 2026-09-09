@@ -38,6 +38,8 @@ node snap-push/server.mjs
 | `SNAP_PUSH_HOST` | `127.0.0.1` | Listen address (loopback only by default) |
 | `SNAP_PUSH_PORT` | `8123` | Listen port |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
+| `SNAP_PUSH_ID_FILE` | `~/.config/snap-push/instance-id` | File persisting the per-instance identity secret (auto-created on first run) |
+| `SNAP_PUSH_ID` | *(empty)* | Pin a fixed instance secret (skips reading/writing the identity file) |
 
 > **On `SNAP_PUSH_HOST`**: keep the default `127.0.0.1`. This tool has **no authentication** — it is meant for local dev convenience, and exposing it to a network is unsafe (and not planned). To reach it from another machine, run snap-push on your dev host bound to loopback and forward the port over SSH, then open <http://127.0.0.1:8123> locally:
 >
@@ -90,6 +92,7 @@ One picture tells the whole story: an image goes from the browser to the local s
 - **"ssh probe failed"**: passwordless login to the target isn't set up, or the host is unreachable. First verify with `ssh user@host` manually.
 - **Remote has no rsync**: nothing to do — it falls back to scp automatically, and the result is labeled `scp`.
 - **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails. Instant-skip logic only looks at the remote — it is independent of local storage.
+- **Where are my configs / history stored?** In the browser's localStorage, namespaced per snap-push instance (header badge `hostname  #hash`). The instance identity is a random secret persisted at `~/.config/snap-push/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID` (or delete it and start clean in the browser).
 
 ## Development
 

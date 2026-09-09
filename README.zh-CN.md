@@ -38,6 +38,8 @@ node snap-push/server.mjs
 | `SNAP_PUSH_HOST` | `127.0.0.1` | 监听地址（默认仅本机回环） |
 | `SNAP_PUSH_PORT` | `8123` | 监听端口 |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | 本机图片落盘目录（页面预览/图库用） |
+| `SNAP_PUSH_ID_FILE` | `~/.config/snap-push/instance-id` | 实例身份 secret 的持久化文件位置（首次运行自动创建） |
+| `SNAP_PUSH_ID` | （空） | 固定实例 secret（跳过身份文件的读写） |
 
 > **关于 `SNAP_PUSH_HOST` 的提醒**：保持默认 `127.0.0.1`。本工具**没有任何认证**，定位是本地研发提效的小工具，暴露到网络不安全，也暂不计划支持。若要在服务器/远程机器上使用，请在开发机上保持回环监听，用 ssh 把本地端口转发过去，再在本地浏览器打开 <http://127.0.0.1:8123>：
 >
@@ -90,6 +92,7 @@ node snap-push/server.mjs
 - **报「ssh 探测失败」**：目标机器免密未配置或网络不通，先手动 `ssh user@host` 验证能否免密登录。
 - **远端没装 rsync**：无需处理，自动用 scp 兜底，上传结果会标注 `scp`。
 - **本地目录（`SNAP_PUSH_DIR`）的作用**：存预览图与图库记录，供页面显示缩略图；妙传判断只看远端，与本地保存无关。
+- **我的服务器配置/历史存在哪？** 存在浏览器 localStorage，并按 snap-push 实例命名空间隔离（头部徽标 `hostname  #hash`）。实例身份是一个持久化在 `~/.config/snap-push/instance-id` 的随机 secret，刻意不依赖 IP——切换网络/VPN/重启都不会让你保存的目标「丢失」。身份文件丢了？可用 `SNAP_PUSH_ID` 固定一个（或删除后浏览器里重新开始）。
 
 ## 开发
 

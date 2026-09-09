@@ -110,28 +110,78 @@ export function mimeOf(name) {
 // 一·五、实例服务 ID：区分「都是 localhost 却指向不同机器」的场景
 // =====================================================================
 
+// 实例身份文件默认位置（可用 SNAP_PUSH_ID_FILE 覆盖）：
+// 身份采用「首次运行生成并持久化的随机 secret」，刻意不依赖 hostname/IP——
+// 否则切网/VPN/重启后 IP 或 hostname 变化会导致身份变化，浏览器里
+// 按实例隔离的目标/历史数据看起来「丢失」。身份文件一旦生成就稳定复用。
+const DEFAULT_ID_FILE = () =>
+  path.join(os.homedir(), '.config', 'snap-push', 'instance-id');
+
+// 默认路径身份 secret 的进程内缓存：避免每次请求都读一次文件
+let cachedSecret = null;
+
 /**
- * 计算本机 snap-push 实例的唯一服务 ID：
- * 以主机名 + 主 IPv4 为基础生成，同一台机器每次启动结果稳定；
- * 短 hash 用作 localStorage 键的命名空间，页面展示用可读的 hostname@ip。
+ * 纯函数：由展示名 label 与身份 secret 计算稳定短 hash（8 位 hex）。
+ * 同 label + secret → 同一 hash；任一变化 → 不同 hash。
+ */
+export function serviceIdFrom(label, secret) {
+  const hash = crypto.createHash('sha256').update(`${label}|${secret}`).digest('hex').slice(0, 8);
+  return { label, hash };
+}
+
+/**
+ * 读取或创建身份 secret（32 位随机 hex）。
+ * 优先级：opts.secret → 环境变量 SNAP_PUSH_ID → 身份文件（不存在则创建）→ 空串。
+ * 身份文件写入/读取失败（如 home 只读）时返回空串，由调用方降级为 hostname 兜底。
+ * @param {object} [opts]
+ * @param {string} [opts.secret] 直接指定 secret（测试/固定复现用，跳过文件）
+ * @param {string} [opts.secretFile] 身份文件路径（测试注入用）；缺省取 SNAP_PUSH_ID_FILE 或默认位置
+ */
+export function getOrCreateSecret(opts = {}) {
+  if (opts.secret) return opts.secret;
+  const fromEnv = process.env.SNAP_PUSH_ID;
+  if (fromEnv) return fromEnv;
+  const idFile = opts.secretFile || process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE();
+  try {
+    // 进程内缓存只用于默认文件路径；测试注入自定义路径时每次直读，避免串缓存
+    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
+      if (cachedSecret) return cachedSecret;
+    }
+    let secret = null;
+    try {
+      secret = fs.readFileSync(idFile, 'utf8').trim();
+    } catch {
+      secret = null; // 文件不存在或不可读
+    }
+    if (!secret) {
+      secret = crypto.randomBytes(16).toString('hex'); // 32 位 hex
+      fs.mkdirSync(path.dirname(idFile), { recursive: true });
+      fs.writeFileSync(idFile, secret + '\n', { mode: 0o600 });
+    }
+    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
+      cachedSecret = secret;
+    }
+    return secret;
+  } catch {
+    return ''; // home 不可写等：交由调用方用 hostname 兜底
+  }
+}
+
+/**
+ * 计算本机 snap-push 实例的唯一服务 ID。
+ * 展示 label 仅用 hostname（IP 完全不参与身份，避免切网/VPN 后变化）；
+ * 身份来自持久化随机 secret（见 getOrCreateSecret），获取失败时降级用 hostname 兜底 hash，
+ * 保证服务始终可用（代价：该兜底场景下身份不跨机器唯一）。
  * 典型场景：同一浏览器先后经 ssh -L 指向不同机器的 snap-push，
  * 地址都是 127.0.0.1:8123（同源），靠该 ID 才能区分是哪一台实例。
+ * @param {object} [opts] 同 getOrCreateSecret，测试可注入
  */
-export function computeServiceId() {
+export function computeServiceId(opts = {}) {
   const hostname = os.hostname();
-  // 收集所有非回环 IPv4 并排序，取第一个作为“主地址”；找不到则回退回环地址
-  const ips = [];
-  const ifaces = os.networkInterfaces();
-  for (const name of Object.keys(ifaces)) {
-    for (const it of ifaces[name]) {
-      if (it.family === 'IPv4' && !it.internal) ips.push(it.address);
-    }
-  }
-  ips.sort();
-  const ip = ips[0] || '127.0.0.1';
-  // 短 hash 稳定标识本实例：主机名与地址任一变化都会得到不同 hash
-  const hash = crypto.createHash('sha256').update(`${hostname}|${ip}`).digest('hex').slice(0, 8);
-  return { hostname, ip, label: `${hostname}@${ip}`, hash };
+  const secret = getOrCreateSecret(opts);
+  // secret 缺失（写入失败等）时退化为 hostname 兜底，仍保证同机同会话内稳定
+  const { label, hash } = serviceIdFrom(hostname, secret || hostname);
+  return { hostname, label, hash };
 }
 
 // =====================================================================
@@ -308,8 +358,8 @@ function sendJson(res, status, obj) {
  * 书写约束：整个页面位于外层模板字符串内，因此页面内禁用反引号与反斜杠
  *           （页面 JS 一律普通引号拼接），也不出现 ${ 序列，避免两层语法互扰。
  */
-function sendIndexPage(res) {
-  const svc = computeServiceId(); // 本实例标识：注入 data-* 供页面做展示与存储键命名空间
+function sendIndexPage(res, svc) {
+  // 本实例标识：注入 data-* 供页面做展示与存储键命名空间
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1347,10 +1397,10 @@ async function route(req, res, ctx) {
 
   if (req.method === 'GET' && pathname === '/health') {
     // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器
-    return sendJson(res, 200, { ok: true, id: computeServiceId() });
+    return sendJson(res, 200, { ok: true, id: ctx.svcId });
   }
   if (req.method === 'GET' && pathname === '/') {
-    return sendIndexPage(res);
+    return sendIndexPage(res, ctx.svcId);
   }
   if (req.method === 'POST' && pathname === '/upload') {
     return handleUpload(req, res, searchParams, ctx);
@@ -1377,6 +1427,8 @@ async function route(req, res, ctx) {
 export function createServer(options = {}) {
   const snapDir = options.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR;
   const maxBody = options.maxBody || MAX_BODY_BYTES;
+  // 实例身份在服务创建时计算一次（可注入 secret/secretFile 便于测试与固定复现）
+  const svcId = computeServiceId(options);
 
   // 串行队列：上传的「写盘 + 远端同步」逐个执行，避免并发 rsync 交叉
   let chain = Promise.resolve();
@@ -1386,7 +1438,7 @@ export function createServer(options = {}) {
     return next;
   };
 
-  const ctx = { snapDir, maxBody, enqueue };
+  const ctx = { snapDir, maxBody, enqueue, svcId };
   const server = http.createServer((req, res) => {
     route(req, res, ctx).catch((err) => {
       // 统一兜底：抛错处可携带 statusCode（如 413），其余按 500 处理

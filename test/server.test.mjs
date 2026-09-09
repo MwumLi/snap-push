@@ -21,6 +21,8 @@ import {
   validateDir,
   isValidStoredName,
   computeServiceId,
+  serviceIdFrom,
+  getOrCreateSecret,
   mimeOf,
   buildProbeScript,
   run,
@@ -41,7 +43,11 @@ function md5hex(bytes) {
 // 启动绑定随机端口的测试服务实例
 function startServer(options) {
   return new Promise((resolve) => {
-    const server = createServer(options);
+    const server = createServer({
+      // 注入临时身份文件：避免测试往真实 home 目录写 snap-push 身份
+      secretFile: path.join(tmpRoot, `instance-${Math.random().toString(36).slice(2)}`),
+      ...options,
+    });
     server.listen(0, '127.0.0.1', () => {
       resolve({ server, base: `http://127.0.0.1:${server.address().port}` });
     });
@@ -200,16 +206,48 @@ describe('纯函数：mimeOf', () => {
 });
 
 describe('实例服务 ID：computeServiceId', () => {
-  test('字段齐全、hash 为 8 位 hex、两次调用稳定', () => {
-    const a = computeServiceId();
-    const b = computeServiceId();
-    // hostname 必须与本机一致；ip 为合法 IPv4 或回退回环
-    assert.equal(a.hostname, os.hostname());
-    assert.ok(/^(\d{1,3}\.){3}\d{1,3}$/.test(a.ip), `ip 应为 IPv4：${a.ip}`);
-    assert.equal(a.label, `${a.hostname}@${a.ip}`);
+  // 单元测试一律注入固定 secret，避免在真实 home 目录写身份文件
+  test('注入 secret：label=hostname、hash 8 位 hex、两次调用稳定', () => {
+    const a = computeServiceId({ secret: 'test-fixed-secret' });
+    const b = computeServiceId({ secret: 'test-fixed-secret' });
+    assert.equal(a.hostname, os.hostname()); // label 仅用 hostname，不含 ip
+    assert.equal(a.label, os.hostname());
+    assert.equal(a.ip, undefined, '身份不再依赖 ip'); // 回归守卫：ip 不得参与
     assert.ok(/^[0-9a-f]{8}$/.test(a.hash), `hash 应为 8 位 hex：${a.hash}`);
-    // 同机同一次运行结果必须稳定
-    assert.deepEqual(b, a);
+    assert.deepEqual(b, a); // 同 secret 必须稳定
+  });
+
+  test('serviceIdFrom 纯函数：同输入稳定、输入变化 hash 变化', () => {
+    const s1 = serviceIdFrom('dev-a', 'secret-1');
+    assert.deepEqual(serviceIdFrom('dev-a', 'secret-1'), s1); // 幂等
+    assert.notEqual(serviceIdFrom('dev-a', 'secret-2').hash, s1.hash); // secret 变→hash 变
+    assert.notEqual(serviceIdFrom('dev-b', 'secret-1').hash, s1.hash); // hostname 变→hash 变
+    // 关键回归：同一机器只换网络/IP 时（hostname 与 secret 不变）hash 必须保持不变
+    assert.equal(serviceIdFrom('dev-a', 'secret-1').hash, s1.hash);
+    assert.ok(/^[0-9a-f]{8}$/.test(s1.hash));
+  });
+
+  test('身份文件：首次创建 32 hex、再次调用读回不变；删除后变化', () => {
+    const dir = fs.mkdtempSync(path.join(tmpRoot, 'idfile-'));
+    const file = path.join(dir, 'instance-id');
+    const a = computeServiceId({ secretFile: file });
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    assert.ok(/^[0-9a-f]{32}$/.test(raw), `身份文件应为 32 位 hex：${raw}`);
+    const b = computeServiceId({ secretFile: file });
+    assert.deepEqual(b, a); // 文件持久化 → 身份稳定
+    // 文件被删 → 重新生成 → hash 变化（说明持久化是稳定关键）
+    fs.unlinkSync(file);
+    const c = computeServiceId({ secretFile: file });
+    assert.notEqual(c.hash, a.hash);
+  });
+
+  test('home 不可写（文件目录无法创建）时降级 hostname 兜底，不抛错', () => {
+    // 指向一个必不可能创建成功的路径（路径存在且是普通文件 → mkdir 失败）
+    const blocker = path.join(tmpRoot, 'blocker-file');
+    fs.writeFileSync(blocker, 'x');
+    const badFile = path.join(blocker, 'sub', 'instance-id');
+    const id = computeServiceId({ secretFile: badFile }); // 不应抛错
+    assert.ok(/^[0-9a-f]{8}$/.test(id.hash));
   });
 });
 
@@ -308,9 +346,11 @@ describe('HTTP 基础接口', () => {
     assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
     const body = await res.json();
     assert.equal(body.ok, true);
-    // 实例标识形状校验（值随机器变化，只验证结构）
+    // 实例标识形状校验（label=hostname；hash 值随 secret 变化，只验证结构）
     assert.equal(typeof body.id, 'object');
-    assert.ok(body.id.hostname && body.id.ip && body.id.label, 'id 缺少 hostname/ip/label');
+    assert.equal(body.id.label, os.hostname());
+    assert.equal(body.id.hostname, os.hostname());
+    assert.equal(body.id.ip, undefined, '身份不应包含 ip');
     assert.ok(/^[0-9a-f]{8}$/.test(body.id.hash), `hash 应为 8 位 hex：${body.id.hash}`);
   });
 
