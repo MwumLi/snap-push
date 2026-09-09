@@ -413,7 +413,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .up-row.up-fail .up-status { color: #cf222e; }
 .msg { min-height: 18px; font-size: 13px; color: #57606a; margin: 8px 0 0; }
 .msg.error { color: #cf222e; }
-#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
 .card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
 .thumb { display: flex; align-items: center; justify-content: center; height: 150px; background: #f0f2f4; }
 .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
@@ -431,17 +431,21 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 历史区双栏布局：左侧图库网格 + 右侧「从图库补齐」抽屉（参与布局、不遮挡） —— */
-.hist-area { display: flex; gap: 14px; align-items: flex-start; }
-#grid { flex: 1; min-width: 0; } /* 抽屉展开挤压宽度时，卡片由 auto-fill 自动换行 */
+/* —— 历史区：左侧网格占满；「从图库补齐」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
+.hist-area { position: relative; }
 #syncDrawer {
-  width: 300px; flex: 0 0 300px;
+  position: fixed; top: 64px; right: 16px; z-index: 50;
+  width: 300px; max-height: calc(100vh - 96px);
   display: flex; flex-direction: column;
-  max-height: calc(100vh - 220px); /* 封顶：避免右侧面板高度撑出视口 */
-  position: sticky; top: 16px;     /* 页面滚动时右栏跟随，列表内部滚动 */
-  background: #fff; border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
+  background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(31, 35, 40, .15); overflow: hidden;
+  /* 收起态：整体从“刚好移出视口右缘”开始（+100% 宽 +16px 边距），配合动画从右缘滑入 */
+  transform: translateX(calc(100% + 16px));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform .24s ease, opacity .18s ease;
 }
-#syncDrawer[hidden] { display: none; }
+#syncDrawer.open { transform: translateX(0); opacity: 1; pointer-events: auto; }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid #f0f2f4; }
 .drawer-head strong { font-size: 13px; word-break: break-all; }
 #syncClose { font-size: 15px; line-height: 1; padding: 1px 8px; }
@@ -502,7 +506,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <h2>历史图库 <span class="count" id="historyCount"></span></h2>
     <div class="hist-area">
       <div id="grid"></div>
-      <aside id="syncDrawer" hidden>
+      <aside id="syncDrawer">
         <header class="drawer-head">
           <strong id="syncTitle">补齐到…</strong>
           <button type="button" id="syncClose" title="关闭">×</button>
@@ -1121,10 +1125,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var srv = currentServer();
     syncLibBtn.disabled = !srv || syncBusy;
     if (!srv) {
-      if (!syncDrawer.hidden) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
+      if (syncDrawer.classList.contains('open')) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
       return;
     }
-    if (!syncDrawer.hidden) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
+    if (syncDrawer.classList.contains('open')) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
   }
 
   function makeCard(f, srv) {
@@ -1435,17 +1439,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     updateSyncSelBtn();
   }
 
-  // 打开抽屉（仅当已选服务器目标；本机无意义）
+  // 打开抽屉（仅当已选服务器目标；本机无意义）：加 .open 触发右滑入动画
   function openDrawer() {
     var srv = currentServer();
     if (!srv) { hint('请先选择目标服务器，再从图库补齐', true); return; }
     syncSelected = {};
-    syncDrawer.hidden = false;
+    syncDrawer.classList.add('open');
     renderSyncList();
   }
 
   function closeDrawer() {
-    syncDrawer.hidden = true;
+    syncDrawer.classList.remove('open');
     syncSelected = {};
   }
 
