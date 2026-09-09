@@ -465,8 +465,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <span id="svcBadge" title="本机服务实例（hostname@ip，短 hash 用于区分同源 localhost）"></span>
     <label for="targetSel">目标</label>
     <select id="targetSel"></select>
-    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
     <button type="button" id="manageBtn">⚙ 管理</button>
+    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
   </div>
 </header>
 <main>
@@ -1092,6 +1092,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 过滤规则：选中服务器 → 只显示 targets 含该 host+dir 的文件；本机 → 全部
   function renderGrid() {
     var srv = currentServer();
+    // 无条件先同步「从图库补齐」按钮/抽屉：切到“还没图”的新目标时也必须解锁按钮
+    refreshSyncArea();
     var files = libFiles.filter(function (f) {
       if (!srv) return true;
       var rec = history[f.name];
@@ -1114,7 +1116,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     files.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
-    refreshSyncArea(); // 图库/目标变化后，同步「从图库补齐」按钮与抽屉状态
   }
 
   // 「从图库补齐」联动：按钮可用性随是否选中服务器变化；抽屉开着时同步刷新列表
