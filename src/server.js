@@ -431,29 +431,31 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 历史区双栏布局：左侧图库网格 + 右侧「从图库补齐」抽屉（参与布局、不遮挡） —— */
-.hist-area { display: flex; gap: 14px; align-items: flex-start; }
-#grid { flex: 1; min-width: 0; } /* 抽屉展开挤压宽度时，卡片由 auto-fill 自动换行 */
+/* —— 历史区：左侧网格占满；「从图库补齐」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
+.hist-area { position: relative; }
 #syncDrawer {
-  width: 300px; flex: 0 0 300px;
+  position: fixed; top: 64px; right: 16px; z-index: 50;
+  width: 300px; max-height: calc(100vh - 96px);
   display: flex; flex-direction: column;
-  max-height: calc(100vh - 220px); /* 封顶：避免右侧面板高度撑出视口 */
-  position: sticky; top: 16px;     /* 页面滚动时右栏跟随，列表内部滚动 */
-  background: #fff; border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
+  background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(31, 35, 40, .15); overflow: hidden;
+  /* 收起态：整体从“刚好移出视口右缘”开始（+100% 宽 +16px 边距），配合动画从右缘滑入 */
+  transform: translateX(calc(100% + 16px));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform .24s ease, opacity .18s ease;
 }
-#syncDrawer[hidden] { display: none; }
+#syncDrawer.open { transform: translateX(0); opacity: 1; pointer-events: auto; }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid #f0f2f4; }
 .drawer-head strong { font-size: 13px; word-break: break-all; }
 #syncClose { font-size: 15px; line-height: 1; padding: 1px 8px; }
-.drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px; }
+.drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
 .sync-empty { color: #8b949e; font-size: 12px; text-align: center; padding: 14px 6px; }
-.sync-item { display: flex; gap: 8px; align-items: center; padding: 5px 4px; border-bottom: 1px solid #f0f2f4; }
-.sync-item:last-child { border-bottom: none; }
-.sync-item img { width: 40px; height: 40px; object-fit: contain; background: #f0f2f4; border-radius: 4px; flex: 0 0 auto; cursor: zoom-in; }
-.sync-name { flex: 1; min-width: 0; font-size: 12px; word-break: break-all; line-height: 1.3; cursor: pointer; color: #1f2328; }
-.sync-name:hover { color: #0969da; }
-.sync-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; flex: 0 0 auto; }
-.sync-actions .sync-err { color: #cf222e; font-size: 11px; max-width: 140px; word-break: break-all; }
+/* 抽屉内缺项 = 历史卡片样式，仅单列铺满抽屉宽 */
+.sync-card { width: 100%; }
+.sync-card .card-ops { justify-content: space-between; align-items: center; margin-top: 2px; }
+.sync-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.sync-err { color: #cf222e; font-size: 11px; word-break: break-all; line-height: 1.4; }
 .drawer-foot { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 8px 10px; border-top: 1px solid #f0f2f4; }
 .drawer-foot .sync-progress { color: #57606a; font-size: 12px; }
 </style>
@@ -465,8 +467,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <span id="svcBadge" title="本机服务实例（hostname@ip，短 hash 用于区分同源 localhost）"></span>
     <label for="targetSel">目标</label>
     <select id="targetSel"></select>
-    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
     <button type="button" id="manageBtn">⚙ 管理</button>
+    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
   </div>
 </header>
 <main>
@@ -504,7 +506,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <h2>历史图库 <span class="count" id="historyCount"></span></h2>
     <div class="hist-area">
       <div id="grid"></div>
-      <aside id="syncDrawer" hidden>
+      <aside id="syncDrawer">
         <header class="drawer-head">
           <strong id="syncTitle">补齐到…</strong>
           <button type="button" id="syncClose" title="关闭">×</button>
@@ -1092,6 +1094,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 过滤规则：选中服务器 → 只显示 targets 含该 host+dir 的文件；本机 → 全部
   function renderGrid() {
     var srv = currentServer();
+    // 无条件先同步「从图库补齐」按钮/抽屉：切到“还没图”的新目标时也必须解锁按钮
+    refreshSyncArea();
     var files = libFiles.filter(function (f) {
       if (!srv) return true;
       var rec = history[f.name];
@@ -1114,7 +1118,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     files.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
-    refreshSyncArea(); // 图库/目标变化后，同步「从图库补齐」按钮与抽屉状态
   }
 
   // 「从图库补齐」联动：按钮可用性随是否选中服务器变化；抽屉开着时同步刷新列表
@@ -1122,10 +1125,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var srv = currentServer();
     syncLibBtn.disabled = !srv || syncBusy;
     if (!srv) {
-      if (!syncDrawer.hidden) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
+      if (syncDrawer.classList.contains('open')) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
       return;
     }
-    if (!syncDrawer.hidden) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
+    if (syncDrawer.classList.contains('open')) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
   }
 
   function makeCard(f, srv) {
@@ -1332,11 +1335,55 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 构建一行「缺项」：勾选框 + 缩略图/名（点开原图）+ 推送按钮 + 错误位
-  function buildSyncRow(f, srv) {
-    var row = document.createElement('div');
-    row.className = 'sync-item';
+  // 构建一个「缺项」卡片：展示与历史图库一致（大缩略图 + 原名 + 大小/时间 + 操作行），单列
+  function buildSyncCard(f, srv) {
+    var card = document.createElement('div');
+    card.className = 'card sync-card';
 
+    var href = '/files/' + encodeURIComponent(f.name);
+
+    // 大缩略图：点击新窗口打开原图（同历史卡片）
+    var link = document.createElement('a');
+    link.className = 'thumb';
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    var img = document.createElement('img');
+    img.src = href;
+    img.alt = f.name;
+    img.loading = 'lazy';
+    link.appendChild(img);
+    card.appendChild(link);
+
+    var body = document.createElement('div');
+    body.className = 'card-body';
+
+    // 原名 + 大小/时间：与历史卡一致
+    var origEl = document.createElement('div');
+    origEl.className = 'orig';
+    origEl.textContent = origOf(f.name);
+    body.appendChild(origEl);
+
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = formatSize(f.size) + ' · ' + formatTime(f.mtime);
+    body.appendChild(meta);
+
+    // 状态行：对齐历史卡「该目标记录」语义；此目标还没有记录 → 显示尚未推送
+    var list = document.createElement('div');
+    list.className = 'targets';
+    var none = document.createElement('div');
+    none.className = 'target-none';
+    none.textContent = '尚未推送到 ' + (srv.label || srv.host);
+    list.appendChild(none);
+    body.appendChild(list);
+
+    // 操作行：左侧「勾选」+ 右侧「推送」
+    var ops = document.createElement('div');
+    ops.className = 'card-ops';
+
+    var lab = document.createElement('label');
+    lab.className = 'sync-check';
     var check = document.createElement('input');
     check.type = 'checkbox';
     check.checked = !!syncSelected[f.name];
@@ -1347,42 +1394,24 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       else delete syncSelected[f.name];
       updateSyncSelBtn();
     });
-    row.appendChild(check);
+    lab.appendChild(check);
+    lab.appendChild(document.createTextNode('选择'));
+    ops.appendChild(lab);
 
-    var href = '/files/' + encodeURIComponent(f.name);
-    var img = document.createElement('img');
-    img.src = href;
-    img.alt = f.name;
-    img.title = '点击查看原图';
-    var aImg = document.createElement('a');
-    aImg.href = href;
-    aImg.target = '_blank';
-    aImg.rel = 'noopener';
-    aImg.appendChild(img);
-    row.appendChild(aImg);
-
-    var nm = document.createElement('a');
-    nm.className = 'sync-name';
-    nm.href = href;
-    nm.target = '_blank';
-    nm.rel = 'noopener';
-    nm.textContent = origOf(f.name);
-    nm.title = origOf(f.name);
-    row.appendChild(nm);
-
-    var act = document.createElement('span');
-    act.className = 'sync-actions';
-    var errEl = document.createElement('span');
-    errEl.className = 'sync-err';
-    act.appendChild(errEl);
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '推送';
+    var errEl = document.createElement('span');
+    errEl.className = 'sync-err';
     btn.addEventListener('click', function () { syncOneRow(f.name, f, btn, errEl); });
-    act.appendChild(btn);
-    row.appendChild(act);
+    ops.appendChild(btn);
+    body.appendChild(ops);
 
-    return row;
+    // 失败提示行（成功时留空，整卡由 renderGrid→renderSyncList 移除）
+    body.appendChild(errEl);
+
+    card.appendChild(body);
+    return card;
   }
 
   // 重绘抽屉列表（缺项集 = 图库 − 已推到当前目标）
@@ -1402,7 +1431,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       updateSyncSelBtn();
       return;
     }
-    missing.forEach(function (f) { syncList.appendChild(buildSyncRow(f, srv)); });
+    missing.forEach(function (f) { syncList.appendChild(buildSyncCard(f, srv)); });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     syncSelAll.textContent = allChecked ? '取消全选' : '全选';
@@ -1410,17 +1439,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     updateSyncSelBtn();
   }
 
-  // 打开抽屉（仅当已选服务器目标；本机无意义）
+  // 打开抽屉（仅当已选服务器目标；本机无意义）：加 .open 触发右滑入动画
   function openDrawer() {
     var srv = currentServer();
     if (!srv) { hint('请先选择目标服务器，再从图库补齐', true); return; }
     syncSelected = {};
-    syncDrawer.hidden = false;
+    syncDrawer.classList.add('open');
     renderSyncList();
   }
 
   function closeDrawer() {
-    syncDrawer.hidden = true;
+    syncDrawer.classList.remove('open');
     syncSelected = {};
   }
 
