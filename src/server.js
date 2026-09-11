@@ -1784,6 +1784,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     row.className = 'target';
     var head = document.createElement('div');
     head.className = 'target-head';
+    // 「远端」徽标与普通卡片的 [妙传]/[恢复] 同位置（服务器名之前）
+    head.appendChild(makeStateBadge('remote-only', '远端'));
     var label = document.createElement('span');
     label.className = 'target-label';
     label.textContent = srv.label || srv.host;
@@ -1798,8 +1800,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     row.appendChild(pathLine);
     list.appendChild(row);
     body.appendChild(list);
-
-    body.appendChild(makeStateBadge('remote-only', '远端'));
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
