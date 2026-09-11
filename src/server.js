@@ -652,6 +652,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .confirm-box h3 { margin: 0 0 8px; font-size: 14px; }
 .confirm-box p { margin: 0 0 10px; font-size: 13px; line-height: 1.5; word-break: break-all; }
 .confirm-check { display: flex; align-items: flex-start; gap: 6px; font-size: 12px; margin-bottom: 12px; cursor: pointer; }
+/* display:flex 会覆盖 hidden 属性默认的 display:none，需显式兜底，否则无复选项时残留空白复选框 */
+.confirm-check[hidden] { display: none; }
 .confirm-ops { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 </head>
