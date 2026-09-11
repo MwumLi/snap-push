@@ -701,9 +701,13 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes('/pull?'), '应引用拉回接口');
     // 回归守卫：#3 恢复记录属于正常一致态，不应再挂 recovered 状态徽标
     assert.ok(!html.includes("makeStateBadge('recovered'"), '不应再挂 recovered 状态徽标');
-    // 图库改名与远端独有展示
+    // 图库改名与状态徽标
     assert.ok(!html.includes('历史图库'), '不应再出现“历史图库”');
-    assert.ok(html.includes("makeStateBadge('remote-only', '远端')"), '应含远端独有卡片的“远端”标识');
+    assert.ok(html.includes("makeStateBadge('remote-only', '远端独有')"), '应含远端独有卡片的“远端独有”标识');
+    assert.ok(html.includes("makeStateBadge('stale', '远端已删')"), '应含“远端已删”状态标识');
+    // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
+    assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
+    assert.ok(!html.includes('badge-verified'), '不应再引用 badge-verified');
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {
@@ -1042,7 +1046,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     return false;
   }
 
-  test('图库按目标渲染“本地 + 远端独有”，远端独有卡片带“远端”标识', async () => {
+  test('图库按目标渲染本地+远端独有，状态徽标为“远端独有”/“远端已删”', async () => {
     const html = await (await fetch(`${base}/`)).text();
     const m = /<script>([\s\S]*?)<\/script>/.exec(html);
     assert.ok(m, '应能提取内嵌 <script>');
@@ -1050,12 +1054,24 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const LOCAL = `${HEX32}-local.png`;
     const REMOTE_ONLY = 'ffffffffffffffffffffffffffffffff-remote.png';
     const REMOTE_ONLY_MD5 = 'ffffffffffffffffffffffffffffffff';
+    const STALE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-stale.png';
 
     const store = new Map();
     store.set('snap-push.servers', JSON.stringify([
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
     ]));
     store.set('snap-push.target', JSON.stringify('s1'));
+    // STALE：有 history 记录但远端已无 → 应显示「远端已删」
+    store.set('snap-push.history', JSON.stringify({
+      [STALE]: {
+        orig: 'stale.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: STALE, remotePath: `/tmp/x/${STALE}`,
+          method: 'rsync', stale: true, time: new Date().toISOString(),
+        }],
+      },
+    }));
     store.set('snap-push.remoteIndex', JSON.stringify({
       '127.0.0.1|/tmp/x': {
         fetchedAt: Date.now(),
@@ -1081,7 +1097,10 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       const u = String(url);
       let body;
       if (u.includes('/api/library')) {
-        body = { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] };
+        body = { files: [
+          { name: LOCAL, size: 10, mtime: new Date().toISOString() },
+          { name: STALE, size: 11, mtime: new Date().toISOString() },
+        ] };
       } else if (u.includes('/api/remote')) {
         body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE_ONLY, md5: REMOTE_ONLY_MD5 }] };
       } else {
@@ -1099,8 +1118,13 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     await new Promise((r) => setTimeout(r, 60)); // 等 refreshHistory + 探测完成
     const grid = byId['grid'];
     assert.ok(hasText(grid, 'local.png'), '应渲染本地卡片');
+    assert.ok(hasText(grid, 'stale.png'), '应渲染远端已删记录所在卡片');
     assert.ok(hasText(grid, 'remote.png'), '应渲染远端独有卡片');
-    assert.ok(hasText(grid, '远端'), '远端独有卡片应带“远端”标识');
+    assert.ok(hasText(grid, '远端独有'), '远端独有卡片应带“远端独有”标识');
+    assert.ok(hasText(grid, '远端已删'), '远端已删记录应带“远端已删”标识');
+    // 恢复记录无徽标；传输方式徽标不再出现在图库卡片上
+    assert.ok(!hasText(grid, '恢复'), '图库卡片不应再出现“恢复”徽标');
+    assert.ok(!hasText(grid, '妙传') && !hasText(grid, 'rsync') && !hasText(grid, 'scp'), '图库卡片不应再出现传输方式徽标');
   });
 });
 

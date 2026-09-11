@@ -640,9 +640,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 #recheckBtn { font-size: 12px; }
 #cleanStaleBtn { font-size: 12px; margin-left: 8px; }
 /* —— 卡片状态徽标 —— */
-.badge-recovered { background: #8250df; }
 .badge-stale { background: #cf222e; }
-.badge-verified { background: #1a7f37; }
 .badge-remote-only { background: #0969da; }
 /* —— 抽屉来源选择 —— */
 .drawer-src { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #f0f2f4; font-size: 12px; }
@@ -936,7 +934,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 传输方式徽标：local=本机落盘 / skip=妙传跳过 / rsync / scp（未知值原样展示）
-  var METHOD_TEXT = { local: '本机', skip: '妙传', rsync: 'rsync', scp: 'scp', recovered: '恢复' };
+  var METHOD_TEXT = { local: '本机', skip: '妙传', rsync: 'rsync', scp: 'scp' };
   function makeMethodBadge(method) {
     var b = document.createElement('span');
     b.className = 'badge badge-' + (METHOD_TEXT[method] ? method : 'other');
@@ -1680,7 +1678,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   function makeCard(f, srv) {
     var rec = history[f.name];
-    var t = srv ? findTargetRec(f.name, srv) : null;
 
     var card = document.createElement('div');
     card.className = 'card';
@@ -1727,9 +1724,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       records.forEach(function (x) { list.appendChild(makeTargetRow(x, f.name)); });
     }
     body.appendChild(list);
-
-    // 状态提示：仅“远端已缺失”需要提示；#3 恢复记录属于正常一致态，不再挂“来自远端”徽标
-    if (t && t.stale) body.appendChild(makeStateBadge('stale', '远端已缺失'));
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
@@ -1784,8 +1778,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     row.className = 'target';
     var head = document.createElement('div');
     head.className = 'target-head';
-    // 「远端」徽标与普通卡片的 [妙传]/[恢复] 同位置（服务器名之前）
-    head.appendChild(makeStateBadge('remote-only', '远端'));
+    // 「远端独有」徽标置于目标行、服务器名之前
+    head.appendChild(makeStateBadge('remote-only', '远端独有'));
     var label = document.createElement('span');
     label.className = 'target-label';
     label.textContent = srv.label || srv.host;
@@ -1815,7 +1809,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return card;
   }
 
-  // 卡片状态徽标（目前仅“远端已缺失”）
+  // 卡片状态徽标（远端独有 / 远端已删）
   function makeStateBadge(kind, text) {
     var b = document.createElement('span');
     b.className = 'badge badge-' + kind;
@@ -1823,14 +1817,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return b;
   }
 
-  // 单条推送记录：徽标 + 目标名 + 时间，路径 / URL 各带复制按钮
+  // 单条推送记录：状态徽标（远端已删）+ 目标名 + 时间，路径 / URL 各带复制按钮
   function makeTargetRow(t, localName) {
     var row = document.createElement('div');
     row.className = 'target';
 
     var head = document.createElement('div');
     head.className = 'target-head';
-    head.appendChild(makeMethodBadge(t.method));
+    // 图库卡片只展示状态：记录在、远端文件已被删时标「远端已删」
+    if (t.stale) head.appendChild(makeStateBadge('stale', '远端已删'));
     var label = document.createElement('span');
     label.className = 'target-label';
     label.textContent = t.label || (t.host || '本机');
@@ -2490,7 +2485,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     else hint('已同步 ' + ok + ' 张到 ' + (target ? (target.label || target.host) : '本机'));
   });
 
-  // 清理当前目标下所有「远端已缺失」的记录（只清本地记录，不动远端与本地文件）
+  // 清理当前目标下所有「远端已删」的记录（只清本地记录，不动远端与本地文件）
   async function cleanStale() {
     var srv = currentServer();
     if (!srv) return;
@@ -2503,7 +2498,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var r = await showConfirm({
       title: '清理失效记录',
       message: '确定清理「' + (srv.label || srv.host) + '」下 ' + staleNames.length +
-        ' 条远端已缺失的记录吗？（只清本地记录，不影响远端与本地文件）',
+        ' 条远端已删的记录吗？（只清本地记录，不影响远端与本地文件）',
       okText: '清理',
     });
     if (!r.confirmed) return;
