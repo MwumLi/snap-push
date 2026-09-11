@@ -1733,6 +1733,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.type = 'button';
     del.className = 'danger';
     del.textContent = '删除';
+    del.disabled = !!(srv && probeBusy[targetKey(srv)]); // 探测在途时置灰，避免用旧快照删除
     del.addEventListener('click', function () { removeFile(f.name, srv); });
     ops.appendChild(del);
     body.appendChild(ops);
@@ -1803,6 +1804,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.type = 'button';
     del.className = 'danger';
     del.textContent = '删除';
+    del.disabled = !!probeBusy[targetKey(srv)]; // 探测在途时置灰，避免用旧快照删除
     del.addEventListener('click', function () { removeRemoteOnly(item, srv); });
     ops.appendChild(del);
     body.appendChild(ops);
@@ -1955,9 +1957,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 从 remoteIndex 缓存移除某文件名（删远端后保持缓存一致）
   function dropRemoteIndexFile(srv, remoteName) {
     var idx = remoteIndex[targetKey(srv)];
-    if (!idx || !Array.isArray(idx.files)) return;
-    idx.files = idx.files.filter(function (f) { return f.name !== remoteName; });
-    saveJson(REMOTE_INDEX_KEY, remoteIndex);
+    if (idx && Array.isArray(idx.files)) {
+      idx.files = idx.files.filter(function (f) { return f.name !== remoteName; });
+      saveJson(REMOTE_INDEX_KEY, remoteIndex);
+    }
+    // 同步内存探测快照：refreshHistory 会用它再做一轮对账，
+    // 若不同步，过期的快照仍含该文件，会把刚删除的记录当「恢复」补录回来。
+    var ps = probeState[targetKey(srv)];
+    if (ps && ps.data && Array.isArray(ps.data.files)) {
+      ps.data.files = ps.data.files.filter(function (f) { return f.name !== remoteName; });
+    }
   }
 
   // 按 host+dir 找服务器配置（历史记录里的目标可能已从配置中删除，故允许为空）
@@ -2014,6 +2023,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 服务器作用域删除：只删该目标的远端文件与记录，本地文件与其他目标记录保留
   async function removeFromServer(name, srv) {
+    // 探测在途时禁止删除：在途探测返回的是删除前的旧快照，会把记录补录回来
+    if (probeBusy[targetKey(srv)]) { hint('正在探测该目标，请稍后再删除', true); return; }
     var t = findTargetRec(name, srv);
     var remoteName = (t && (t.remoteName || baseName(t.remotePath))) || name;
     var r = await showConfirm({
@@ -2270,6 +2281,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 删除「远端独有（本地无副本）」条目：只删远端文件与 remoteIndex 条目
   async function removeRemoteOnly(item, srcSrv) {
+    // 探测在途时禁止删除：在途探测返回的是删除前的旧快照，会把记录补录回来
+    if (probeBusy[targetKey(srcSrv)]) { hint('正在探测该来源，请稍后再删除', true); return; }
     var r = await showConfirm({
       title: '删除远端文件',
       message: '确定从「' + (srcSrv.label || srcSrv.host) + '」删除「' + origFromName(item.name) + '」吗？将删除该服务器上的文件。',
@@ -2366,6 +2379,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       delBtn.type = 'button';
       delBtn.className = 'danger';
       delBtn.textContent = '删除';
+      delBtn.disabled = !!probeBusy[targetKey(srcSrv)]; // 探测在途时置灰，避免用旧快照删除
       delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv); });
       ops.appendChild(delBtn);
     }

@@ -973,18 +973,33 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
   function makeEl() {
     return {
       _children: [],
+      _listeners: {},
+      _text: '',
       style: {},
       classList: { add() {}, remove() {}, contains() { return false; } },
       appendChild(c) { this._children.push(c); return c; },
-      addEventListener() {},
-      removeEventListener() {},
+      // 模拟真实 DOM：设置 textContent 会清空子节点（renderGrid 依赖此行为清空重建）
+      get textContent() { return this._text; },
+      set textContent(v) { this._text = String(v); this._children = []; },
+      addEventListener(type, fn) {
+        (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+      },
+      removeEventListener(type, fn) {
+        const a = this._listeners[type];
+        if (!a) return;
+        const i = a.indexOf(fn);
+        if (i >= 0) a.splice(i, 1);
+      },
+      // 测试用：派发已注册的监听器（真实浏览器由用户交互触发）
+      _trigger(type, ev) {
+        (this._listeners[type] || []).slice().forEach((fn) => fn(ev || {}));
+      },
       getAttribute() { return ''; },
       setAttribute() {},
       removeAttribute() {},
       focus() {},
       click() {},
       reset() {},
-      textContent: '',
       value: '',
       hidden: false,
       disabled: false,
@@ -1003,20 +1018,45 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
   }
 
+  // 递归查找 mock 节点树里的节点（供测试定位删除按钮等）
+  function findNode(node, pred) {
+    if (!node) return null;
+    if (pred(node)) return node;
+    for (const c of node._children || []) {
+      const r = findNode(c, pred);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  // 构造 mock document：byId 缓存元素、createElement 记录 tagName
+  function makeDocumentShim(byId) {
+    return {
+      body: makeEl(),
+      getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
+      createElement(tag) {
+        const el = makeEl();
+        el.tagName = String(tag || '').toUpperCase();
+        return el;
+      },
+      createTextNode(t) { return { text: t }; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  }
+
+  // 定位卡片上的「删除」按钮（className=danger 且文本为「删除」）
+  function findDeleteBtn(root) {
+    return findNode(root, (n) => n.className === 'danger' && n.textContent === '删除');
+  }
+
   test('从 GET / 提取脚本并在垫片中初始化不抛异常', async () => {
     const html = await (await fetch(`${base}/`)).text();
     const m = /<script>([\s\S]*?)<\/script>/.exec(html);
     assert.ok(m, '应能提取内嵌 <script>');
 
     const byId = {};
-    const documentShim = {
-      body: makeEl(),
-      getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
-      createElement() { return makeEl(); },
-      createTextNode(t) { return { text: t }; },
-      addEventListener() {},
-      removeEventListener() {},
-    };
+    const documentShim = makeDocumentShim(byId);
     const store = new Map();
     const localStorageShim = {
       getItem(k) { return store.has(k) ? store.get(k) : null; },
@@ -1080,14 +1120,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     }));
 
     const byId = {};
-    const documentShim = {
-      body: makeEl(),
-      getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
-      createElement() { return makeEl(); },
-      createTextNode(t) { return { text: t }; },
-      addEventListener() {},
-      removeEventListener() {},
-    };
+    const documentShim = makeDocumentShim(byId);
     const localStorageShim = {
       getItem(k) { return store.has(k) ? store.get(k) : null; },
       setItem(k, v) { store.set(k, String(v)); },
@@ -1125,6 +1158,147 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     // 恢复记录无徽标；传输方式徽标不再出现在图库卡片上
     assert.ok(!hasText(grid, '恢复'), '图库卡片不应再出现“恢复”徽标');
     assert.ok(!hasText(grid, '妙传') && !hasText(grid, 'rsync') && !hasText(grid, 'scp'), '图库卡片不应再出现传输方式徽标');
+  });
+
+  // 回归：删除远端后，refreshHistory 不得用过期探测快照把记录“恢复”回来。
+  // 修复前：dropRemoteIndexFile 未同步 probeState，删除后卡片复活，刷新后误标「远端已删」。
+  test('服务器目标删除后卡片立即消失，且不残留“远端已删”', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const KEY = '127.0.0.1|/tmp/x';
+
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.history', JSON.stringify({
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    }));
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
+    }));
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    let deleteCalled = false;
+    const fetchShim = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || 'GET';
+      if (method === 'DELETE') {
+        deleteCalled = true;
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      let body;
+      if (u.includes('/api/library')) {
+        body = { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] };
+      } else if (u.includes('/api/remote')) {
+        body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }] };
+      } else {
+        body = { ok: true };
+      }
+      return { ok: true, status: 200, json: async () => body };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 60)); // 等 refreshHistory + 探测完成
+    const grid = byId['grid'];
+    assert.ok(hasText(grid, 'local.png'), '删除前应渲染本地卡片');
+
+    const delBtn = findDeleteBtn(grid);
+    assert.ok(delBtn, '应能定位到删除按钮');
+    delBtn._trigger('click'); // 触发删除 → 弹确认
+    byId['confirmOk']._trigger('click'); // 确认删除
+
+    await new Promise((r) => setTimeout(r, 80)); // 等删除请求 + refreshHistory 重绘
+    assert.ok(deleteCalled, '应发起远端删除请求');
+    assert.ok(!hasText(grid, 'local.png'), '删除后卡片应立即消失');
+    assert.ok(!hasText(grid, '远端已删'), '删除后不应残留“远端已删”记录');
+  });
+
+  // 回归：探测在途时删除按钮置灰，且点击被守卫拒绝（避免用在途探测的旧快照删除）。
+  test('探测在途时删除按钮置灰且点击被拒', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.history', JSON.stringify({
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    }));
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    let deleteCalled = false;
+    const fetchShim = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || 'GET';
+      if (method === 'DELETE') {
+        deleteCalled = true;
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      if (u.includes('/api/library')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
+      }
+      if (u.includes('/api/remote')) {
+        return new Promise(() => {}); // 永不 resolve：让探测一直处于在途
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 60)); // 等 refreshHistory 完成渲染（探测仍在途）
+    const grid = byId['grid'];
+    const delBtn = findDeleteBtn(grid);
+    assert.ok(delBtn, '应能定位到删除按钮');
+    assert.equal(delBtn.disabled, true, '探测在途时删除按钮应置灰');
+
+    delBtn._trigger('click'); // 触发被守卫拒绝
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(deleteCalled, false, '探测在途时点击删除不应发起请求');
+    assert.equal((byId['confirmOk']._listeners.click || []).length, 0, '探测在途时不应弹出确认框');
   });
 });
 
