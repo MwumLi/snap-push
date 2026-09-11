@@ -1675,9 +1675,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     body.appendChild(list);
 
-    // 状态提示：远端已缺失 / 从远端恢复（有记录才有意义）
+    // 状态提示：仅“远端已缺失”需要提示；#3 恢复记录属于正常一致态，不再挂“来自远端”徽标
     if (t && t.stale) body.appendChild(makeStateBadge('stale', '远端已缺失'));
-    if (t && t.origin === 'recovered') body.appendChild(makeStateBadge('recovered', '来自远端'));
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
@@ -1693,7 +1692,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return card;
   }
 
-  // 卡片状态徽标（失效 / 来自远端）
+  // 卡片状态徽标（目前仅“远端已缺失”）
   function makeStateBadge(kind, text) {
     var b = document.createElement('span');
     b.className = 'badge badge-' + kind;

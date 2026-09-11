@@ -699,6 +699,8 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes('id="syncSource"'), '应含同步来源选择');
     assert.ok(html.includes('/api/remote?'), '应引用远端探测接口');
     assert.ok(html.includes('/pull?'), '应引用拉回接口');
+    // 回归守卫：#3 恢复记录属于正常一致态，不应再挂 recovered 状态徽标
+    assert.ok(!html.includes("makeStateBadge('recovered'"), '不应再挂 recovered 状态徽标');
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {
