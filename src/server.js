@@ -1379,6 +1379,26 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return p;
   }
 
+  // 剪贴板图片命名用时间戳：本地时间 YYYYMMDD_HHmmss（各段补零，便于人类一眼分辨）
+  function pasteStamp() {
+    var d = new Date();
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    return '' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate())
+      + '_' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  }
+
+  // 剪贴板图片的扩展名：优先按 MIME 类型推断，其次取原文件名扩展名，最后回退 png
+  // （扩展名决定服务端 Content-Type，缺失会导致缩略图按二进制流返回）
+  function pasteExt(file) {
+    var byMime = {
+      'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+      'image/webp': 'webp', 'image/bmp': 'bmp', 'image/svg+xml': 'svg',
+    };
+    if (file && file.type && byMime[file.type]) return byMime[file.type];
+    var m = /\.([A-Za-z0-9]+)$/.exec((file && file.name) || '');
+    return m ? m[1].toLowerCase() : 'png';
+  }
+
   // 追加一行上传结果（文件名 + 状态区），返回状态区引用供更新
   function addResultRow(fileName) {
     var row = document.createElement('div');
@@ -1428,11 +1448,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 单文件上传：body 直接放 File 对象（浏览器按原始字节发送）
-  async function uploadOne(file, srv) {
-    var entry = addResultRow(file.name);
+  async function uploadOne(file, srv, name) {
+    name = name || file.name; // 未指定时沿用原始文件名（粘贴场景由调用方给 paste_<时间戳>）
+    var entry = addResultRow(name);
     try {
       var p = targetParams(srv);
-      p.set('name', file.name);
+      p.set('name', name);
       var res;
       try {
         res = await fetch('/upload?' + p.toString(), { method: 'POST', body: file });
@@ -1446,7 +1467,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (!res.ok || !jsonOk || !data.ok) {
         throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
       }
-      recordUpload(data, file.name, srv);
+      recordUpload(data, name, srv);
 
       // 成功态：方式徽标 + 路径（有 URL 再加一行）+ 各自的复制按钮
       entry.status.textContent = '';
@@ -1468,7 +1489,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 批量入口：过滤出图片后串行逐个上传（后端上传队列本身串行，前端逐个展示结果）
-  async function uploadFiles(fileList) {
+  // nameFor(file, index) 可选：为图片生成上传用文件名（如粘贴场景），缺省用原始文件名
+  async function uploadFiles(fileList, nameFor) {
     var files = [];
     var skipped = 0; // 非 image/* 文件计数，用于提示用户有文件被忽略
     for (var i = 0; i < fileList.length; i++) {
@@ -1482,7 +1504,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (skipped) hint('已忽略 ' + skipped + ' 个非图片文件，仅上传 ' + files.length + ' 张图片', true);
     var srv = currentServer();
     for (var j = 0; j < files.length; j++) {
-      await uploadOne(files[j], srv);
+      var name = nameFor ? nameFor(files[j], j) : null;
+      await uploadOne(files[j], srv, name);
     }
     refreshHistory(); // 全部完成后刷新历史区
   }
@@ -1520,10 +1543,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     fileInput.click();
   });
 
-  // 粘贴截图：剪贴板里带文件对象时（系统截图 / 复制图片）触发上传
+  // 粘贴截图：剪贴板里带文件对象时（系统截图 / 复制图片）触发上传。
+  // 剪贴板图片通常没有有意义的文件名，统一命名 paste_<YYYYMMDD_HHmmss>.<ext>；
+  // 一次粘贴多张时共用同一时间戳，第 2 张起追加 _2、_3 区分。
   document.addEventListener('paste', function (e) {
     if (!e.clipboardData || !e.clipboardData.files || !e.clipboardData.files.length) return;
-    uploadFiles(e.clipboardData.files);
+    var stamp = pasteStamp();
+    var n = 0;
+    uploadFiles(e.clipboardData.files, function (file) {
+      n++;
+      return 'paste_' + stamp + (n === 1 ? '' : '_' + n) + '.' + pasteExt(file);
+    });
   });
 
   // =============== 历史图库 ===============
