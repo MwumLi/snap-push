@@ -24,6 +24,7 @@ const DEFAULT_PORT = 8123;
 const DEFAULT_SNAP_DIR = '/tmp/snap-push';   // 本机图片落盘目录
 const MAX_BODY_BYTES = 20 * 1024 * 1024;     // 上传体积上限：20MB
 const SUBPROCESS_TIMEOUT_MS = 30_000;        // ssh/rsync/scp 单次执行超时
+const PROBE_TIMEOUT_MS = 10_000;             // 目标探测超时：探测是后台行为，收短避免长时间占用
 const STDERR_SUMMARY_LIMIT = 300;            // 错误信息中 stderr 摘要的最大长度
 
 // ssh/scp 共用的免交互参数：
@@ -76,7 +77,10 @@ export function validateDir(v) {
   if (typeof v !== 'string' || !v.startsWith('/')) return null;
   if (!/^[A-Za-z0-9._/-]+$/.test(v)) return null;
   const trimmed = v.replace(/\/+$/, '');
-  return trimmed.length > 0 ? trimmed : null;
+  if (trimmed.length === 0) return null;
+  // 拒绝 .. 路径段：/tmp/../etc 这类目录会把远端读/删能力放大到父目录
+  if (trimmed.split('/').some((seg) => seg === '..')) return null;
+  return trimmed;
 }
 
 /**
@@ -85,6 +89,77 @@ export function validateDir(v) {
  */
 export function isValidStoredName(name) {
   return typeof name === 'string' && /^[0-9a-f]{32}-[A-Za-z0-9._-]+$/.test(name);
+}
+
+/**
+ * 取出存储名里的内容 md5（前 32 位小写 hex）。
+ * 不符合 <md5>-<原名> 约定时返回 null——调用方据此决定按“内容”还是按“文件名”处理。
+ */
+export function md5OfName(name) {
+  const m = /^([0-9a-f]{32})-/.exec(typeof name === 'string' ? name : '');
+  return m ? m[1] : null;
+}
+
+/**
+ * 从存储名 <md5>-<原名> 中还原展示原名；不符合约定时整体当作原名。
+ * 用于“远端名 → 本地名”的重命名（如 pull 时用远端名做原名）。
+ */
+export function origFromStoredName(name) {
+  const m = /^[0-9a-f]{32}-(.+)$/.exec(typeof name === 'string' ? name : '');
+  return m ? m[1] : (name || 'image.png');
+}
+
+/**
+ * 校验远端文件名（比本地存储名宽松）：仅允许 [A-Za-z0-9._-]。
+ * 不含斜杠、引号、空白，因此可安全嵌入单引号 shell 命令；
+ * 同时兼容用户手工放进目标目录、不带 md5 前缀的文件。
+ * 纯点（. / ..）单独拒绝，避免目录穿越语义。
+ */
+export function validateRemoteFileName(name) {
+  if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
+  return /^\.+$/.test(name) ? null : name;
+}
+
+/**
+ * 构造“探测 + 列目录”的远端 shell 脚本（在远端 sh 执行）：
+ *   1) 目录不存在/不可读 → 只输出 __DIR_MISSING__，前端按“远端为空”处理；
+ *   2) 用 command -v 检测远端是否装了 rsync（决定 pull 走 rsync 还是 scp）；
+ *   3) ls -1 列出目录内文件名，交给 parseRemoteList 过滤解析。
+ * dir 进入本函数前已过 validateDir 白名单，嵌入单引号是安全的。
+ */
+export function buildRemoteListScript(dir) {
+  return [
+    `if [ -d '${dir}' ]; then`,
+    '  echo ::DIR_OK::;',
+    '  command -v rsync >/dev/null 2>&1 && echo ::RSYNC_OK:: || echo ::RSYNC_NO::;',
+    `  ls -1 '${dir}' 2>/dev/null;`,
+    'else',
+    '  echo ::DIR_MISSING::;',
+    'fi',
+  ].join('\n');
+}
+
+/**
+ * 解析 buildRemoteListScript 的输出。
+ * 标记行（__DIR_OK__ / __RSYNC_OK__ / __RSYNC_NO__ / __DIR_MISSING__）不进入文件列表；
+ * 文件名行只保留通过 validateRemoteFileName 的项，并尽量解析出 md5。
+ * 目录缺失时返回空清单（dirExists:false），由调用方按“远端为空”处理。
+ */
+export function parseRemoteList(stdout) {
+  const result = { dirExists: false, hasRsync: false, files: [] };
+  const lines = String(stdout || '').split('\n');
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === '::DIR_MISSING::') return { dirExists: false, hasRsync: false, files: [] };
+    if (line === '::DIR_OK::') { result.dirExists = true; continue; }
+    if (line === '::RSYNC_OK::') { result.hasRsync = true; continue; }
+    if (line === '::RSYNC_NO::') continue;
+    const name = validateRemoteFileName(line);
+    if (!name) continue; // 含空格/特殊字符等：不是本工具管理的文件，忽略
+    result.files.push({ name, md5: md5OfName(name) });
+  }
+  return result;
 }
 
 // 扩展名 → Content-Type 映射（仅图片类，其余一律按二进制流返回）
@@ -237,6 +312,68 @@ export function run(cmd, args, timeoutMs = SUBPROCESS_TIMEOUT_MS) {
   });
 }
 
+/**
+ * 与 run 相同的执行封装，但 stdout 以 Buffer 收集（不做 utf8 解码），
+ * 用于读取图片等二进制内容。超过 limit 字节立即强杀并失败，避免大文件占满内存。
+ */
+export function runBuffer(cmd, args, timeoutMs = SUBPROCESS_TIMEOUT_MS, limit = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      reject(new Error(`无法启动命令 ${cmd}：${err.message}`));
+      return;
+    }
+
+    const chunks = [];
+    let total = 0;
+    let stderr = '';
+    let timedOut = false;
+    let settled = false; // 防止 超限 / error / close 之间重复 settle
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill('SIGKILL');
+      reject(err);
+    };
+
+    child.stdout.on('data', (d) => {
+      if (settled) return;
+      total += d.length;
+      if (total > limit) {
+        fail(new Error(`远端文件超过大小上限（${formatSize(limit)}）`));
+        return;
+      }
+      chunks.push(d);
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (d) => { stderr += d; });
+
+    child.on('error', (err) => {
+      const e = new Error(`无法执行命令 ${cmd}：${err.message}`);
+      e.isMissingBinary = err.code === 'ENOENT';
+      fail(e);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`命令超时（超过 ${timeoutMs}ms 已终止）：${cmd}`));
+        return;
+      }
+      resolve({ code, stdout: Buffer.concat(chunks), stderr });
+    });
+  });
+}
+
 // =====================================================================
 // 三、远端同步执行器：ssh 探测妙传 → rsync → scp 兜底
 // =====================================================================
@@ -334,6 +471,42 @@ export async function syncToRemote(localPath, name, { host, user, dir }) {
   throw new Error(`rsync 同步失败（退出码 ${rsyncResult.code}）：${summarizeStderr(rsyncResult.stderr)}`);
 }
 
+/**
+ * 从远端取回单个文件到本地路径（pull 方向，与 syncToRemote 相反）：
+ * 优先 rsync -az；本地或远端缺 rsync 时回退 scp；其余错误带 stderr 摘要抛出。
+ */
+export async function pullToLocal(localPath, name, { host, user, dir }) {
+  let rsyncResult = null;
+  let localRsyncMissing = false;
+  try {
+    rsyncResult = await run('rsync', [
+      '-az',
+      '-e',
+      `ssh ${SSH_ARGS.join(' ')}`,
+      `${user}@${host}:${dir}/${name}`,
+      localPath,
+    ]);
+  } catch (err) {
+    if (!err.isMissingBinary) throw err; // 本地 rsync 缺失以外的错误直接抛出
+    localRsyncMissing = true;
+  }
+
+  if (rsyncResult && rsyncResult.code === 0) {
+    return { method: 'rsync' };
+  }
+  const remoteRsyncMissing =
+    rsyncResult && rsyncResult.code !== 0 && rsyncResult.stderr.toLowerCase().includes('not found');
+  if (localRsyncMissing || remoteRsyncMissing) {
+    const r = await run('scp', [...SSH_ARGS, `${user}@${host}:${dir}/${name}`, localPath]);
+    if (r.code !== 0) {
+      throw new Error(`scp 拉取失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`);
+    }
+    return { method: 'scp' };
+  }
+
+  throw new Error(`rsync 拉取失败（退出码 ${rsyncResult.code}）：${summarizeStderr(rsyncResult.stderr)}`);
+}
+
 // =====================================================================
 // 四、HTTP 服务
 // =====================================================================
@@ -350,7 +523,8 @@ function sendJson(res, status, obj) {
  * 页面结构：
  *   - 顶部：目标下拉（本机 + localStorage 服务器配置）与「⚙ 管理」配置面板（增/改/删）；
  *   - 上传区：文件选择 / 拖拽 / Ctrl+V 粘贴截图，逐文件 POST /upload 并展示结果；
- *   - 历史区：/api/library 与 localStorage 历史（snap-push.history）求交渲染，
+ *   - 图库：按当前目标渲染全部图片（本地存在 + 远端独有），
+ *     /api/library 与 localStorage 历史（snap-push.history）求交，远端独有取自 remoteIndex，
  *     按当前目标（host+dir）过滤，支持复制路径/URL、删除（联动清历史记录）、对账清理。
  *
  * 安全约定：动态内容一律 createElement + textContent，绝不拼接 innerHTML；
@@ -431,7 +605,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 历史区：左侧网格占满；「从图库补齐」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
+/* —— 图库区：左侧网格占满；「同步」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
 .hist-area { position: relative; }
 #syncDrawer {
   position: fixed; top: 64px; right: 16px; z-index: 50;
@@ -458,6 +632,27 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .sync-err { color: #cf222e; font-size: 11px; word-break: break-all; line-height: 1.4; }
 .drawer-foot { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 8px 10px; border-top: 1px solid #f0f2f4; }
 .drawer-foot .sync-progress { color: #57606a; font-size: 12px; }
+
+/* —— 目标状态徽标 + 对账摘要 —— */
+#targetStatus { font-size: 12px; color: #57606a; white-space: nowrap; }
+#targetStatus.online { color: #1a7f37; }
+#targetStatus.offline { color: #cf222e; }
+#recheckBtn { font-size: 12px; }
+#cleanStaleBtn { font-size: 12px; margin-left: 8px; }
+/* —— 卡片状态徽标 —— */
+.badge-stale { background: #cf222e; }
+.badge-remote-only { background: #0969da; }
+/* —— 抽屉来源选择 —— */
+.drawer-src { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #f0f2f4; font-size: 12px; }
+.drawer-src select { flex: 1; }
+/* —— 确认模态 —— */
+#confirmMask { position: fixed; inset: 0; z-index: 100; background: rgba(31, 35, 40, .35); display: flex; align-items: center; justify-content: center; }
+#confirmMask[hidden] { display: none; }
+.confirm-box { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; box-shadow: 0 8px 24px rgba(31, 35, 40, .2); width: 380px; max-width: calc(100vw - 32px); padding: 14px 16px; }
+.confirm-box h3 { margin: 0 0 8px; font-size: 14px; }
+.confirm-box p { margin: 0 0 10px; font-size: 13px; line-height: 1.5; word-break: break-all; }
+.confirm-check { display: flex; align-items: flex-start; gap: 6px; font-size: 12px; margin-bottom: 12px; cursor: pointer; }
+.confirm-ops { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 </head>
 <body data-svc="${svc.hash}" data-svc-label="${svc.label}">
@@ -467,8 +662,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <span id="svcBadge" title="本机服务实例（hostname@ip，短 hash 用于区分同源 localhost）"></span>
     <label for="targetSel">目标</label>
     <select id="targetSel"></select>
+    <span id="targetStatus"></span>
     <button type="button" id="manageBtn">⚙ 管理</button>
-    <button type="button" id="syncLibBtn" disabled title="选择目标服务器后，可从本地图库补齐未推送的图片">从图库补齐</button>
+    <button type="button" id="syncLibBtn" disabled title="在当前目标与来源之间同步图片（来源可为本地或其他服务器）">同步</button>
+    <button type="button" id="recheckBtn" title="强制重新探测当前目标服务器">重新对账</button>
   </div>
 </header>
 <main>
@@ -501,16 +698,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <p class="msg" id="msg"></p>
   </section>
 
-  <!-- 历史区：按当前目标过滤；右侧抽屉（从图库补齐）参与布局，不遮挡左侧 -->
+  <!-- 图库：当前目标下的全部图片（本地 + 远端独有）；右侧抽屉（同步）为悬浮层，不遮挡左侧 -->
   <section>
-    <h2>历史图库 <span class="count" id="historyCount"></span></h2>
+    <h2>图库 <span class="count" id="historyCount"></span>
+      <button type="button" id="cleanStaleBtn" hidden>清理失效记录</button>
+    </h2>
     <div class="hist-area">
       <div id="grid"></div>
       <aside id="syncDrawer">
         <header class="drawer-head">
-          <strong id="syncTitle">补齐到…</strong>
+          <strong id="syncTitle">同步…</strong>
           <button type="button" id="syncClose" title="关闭">×</button>
         </header>
+        <div class="drawer-src">
+          <label for="syncSource">来源</label>
+          <select id="syncSource"></select>
+        </div>
         <div id="syncList" class="drawer-list"></div>
         <footer class="drawer-foot">
           <button type="button" id="syncSelAll">全选</button>
@@ -520,6 +723,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     </div>
   </section>
 </main>
+
+<!-- 通用确认弹窗：window.confirm 放不下复选项，这里自绘一个轻量模态 -->
+<div id="confirmMask" hidden>
+  <div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <h3 id="confirmTitle"></h3>
+    <p id="confirmMsg"></p>
+    <label class="confirm-check" id="confirmCheckWrap" hidden>
+      <input type="checkbox" id="confirmCheck">
+      <span id="confirmCheckLabel"></span>
+    </label>
+    <div class="confirm-ops">
+      <button type="button" id="confirmCancel">取消</button>
+      <button type="button" id="confirmOk" class="danger">删除</button>
+    </div>
+  </div>
+</div>
 <script>
 (function () {
   'use strict';
@@ -538,6 +757,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var SERVERS_KEY = storageKey('servers');
   var HISTORY_KEY = storageKey('history');
   var TARGET_KEY = storageKey('target'); // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
+  var REMOTE_INDEX_KEY = storageKey('remoteIndex'); // 远端清单缓存：{"<host>|<dir>": {fetchedAt, files}}
 
   function loadJson(key, fallback) {
     try {
@@ -582,11 +802,20 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var history = loadJson(HISTORY_KEY, {});
   if (typeof history !== 'object' || history === null || Array.isArray(history)) history = {};
   var libFiles = []; // 最近一次 GET /api/library 的文件清单
+  var remoteIndex = loadJson(REMOTE_INDEX_KEY, {}); // 远端清单缓存，见 REMOTE_INDEX_KEY
+  if (typeof remoteIndex !== 'object' || remoteIndex === null || Array.isArray(remoteIndex)) remoteIndex = {};
+  var probeState = {}; // 内存态：<targetKey> -> { at, data } 最近一次探测结果（避免频繁 ssh）
+  var probeSeq = {}; // <targetKey> -> 最新请求序号，用于丢弃过期响应
+  var probeBusy = {}; // <targetKey> -> true 表示探测进行中
+  var PROBE_TTL_MS = 30000; // 探测结果缓存有效期：期间切换目标直接复用，手动「重新对账」可强制刷新
   var syncSelected = {}; // 「从图库补齐」抽屉的勾选集合：localName -> true
   var syncBusy = false; // 同步进行中：期间禁用勾选/按钮，避免交叉
 
   // =============== DOM 引用 ===============
   var targetSel = document.getElementById('targetSel');
+  var targetStatus = document.getElementById('targetStatus');
+  var recheckBtn = document.getElementById('recheckBtn');
+  var cleanStaleBtn = document.getElementById('cleanStaleBtn');
   var manageBtn = document.getElementById('manageBtn');
   var svcBadge = document.getElementById('svcBadge');
   var managePanel = document.getElementById('managePanel');
@@ -607,11 +836,21 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var grid = document.getElementById('grid');
   var historyCount = document.getElementById('historyCount');
   var syncLibBtn = document.getElementById('syncLibBtn');
+  var syncSourceSel = document.getElementById('syncSource');
   var syncDrawer = document.getElementById('syncDrawer');
   var syncTitle = document.getElementById('syncTitle');
   var syncList = document.getElementById('syncList');
   var syncClose = document.getElementById('syncClose');
   var syncSelAll = document.getElementById('syncSelAll');
+  // 确认弹窗元素
+  var confirmMask = document.getElementById('confirmMask');
+  var confirmTitle = document.getElementById('confirmTitle');
+  var confirmMsg = document.getElementById('confirmMsg');
+  var confirmCheckWrap = document.getElementById('confirmCheckWrap');
+  var confirmCheck = document.getElementById('confirmCheck');
+  var confirmCheckLabel = document.getElementById('confirmCheckLabel');
+  var confirmOk = document.getElementById('confirmOk');
+  var confirmCancel = document.getElementById('confirmCancel');
   var syncSelBtn = document.getElementById('syncSelBtn');
 
   // 展示本实例标识（hostname@ip + 短 hash），帮助识别当前 localhost 指向哪台机器
@@ -744,6 +983,250 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     saveJson(TARGET_KEY, targetSel.value); // 固化实际生效的选择
   }
 
+  // =============== 远端探测与对账 ===============
+
+  // 目标唯一键：本机为空串；服务器用 host|dir（昵称变化不影响缓存与对账）
+  function targetKey(srv) {
+    return srv ? (srv.host + '|' + srv.dir) : '';
+  }
+
+  // 存储名/文件名前 32 位 hex 即内容 md5；不符合约定返回 null
+  function md5Of(name) {
+    var m = /^([0-9a-f]{32})-/.exec(name || '');
+    return m ? m[1] : null;
+  }
+
+  // 取路径最后一段（远端路径 /dir/name → name）
+  function baseName(p) {
+    var s = p || '';
+    var i = s.lastIndexOf('/');
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  // 展示原名：去掉 <md5>- 前缀；不是存储名则原样返回
+  function origFromName(name) {
+    var base = baseName(name);
+    return /^[0-9a-f]{32}-/.test(base) ? base.slice(33) : base;
+  }
+
+  // 在 history 中查「本地文件 → 某目标」的推送记录
+  function findTargetRec(localName, srv) {
+    var rec = history[localName];
+    if (!rec || !Array.isArray(rec.targets)) return null;
+    for (var i = 0; i < rec.targets.length; i++) {
+      if (rec.targets[i].host === srv.host && rec.targets[i].dir === srv.dir) return rec.targets[i];
+    }
+    return null;
+  }
+
+  // 目标上下文下的展示名：本机用本地原名；服务器优先用该目标上的远端名
+  function nameOnTarget(localName, srv) {
+    var rec = history[localName];
+    var localOrig = (rec && rec.orig) ? rec.orig : origFromName(localName);
+    if (!srv) return localOrig;
+    var t = findTargetRec(localName, srv);
+    if (!t) return localOrig;
+    return origFromName(t.remoteName || t.remotePath || '') || localOrig;
+  }
+
+  // 远端清单里是否含某 md5（对账与抽屉去重都用它）
+  function remoteHasMd5(srv, md5) {
+    var idx = remoteIndex[targetKey(srv)];
+    if (!idx || !Array.isArray(idx.files)) return false;
+    return idx.files.some(function (f) { return f.md5 === md5; });
+  }
+
+  // 本地图库中该 md5 对应的文件名（同内容不同原名皆可）
+  function localNameByMd5(md5) {
+    for (var i = 0; i < libFiles.length; i++) {
+      if (md5Of(libFiles[i].name) === md5) return libFiles[i].name;
+    }
+    return null;
+  }
+
+  // 组装“已恢复”记录：本地有字节、远端确认存在、但缺 history（#3 场景）
+  function makeRecoveredTarget(srv, remoteName) {
+    return {
+      key: srv.id,
+      label: srv.label || srv.host,
+      host: srv.host,
+      dir: srv.dir,
+      remoteName: remoteName,
+      remotePath: srv.dir + '/' + remoteName,
+      url: srv.urlBase ? srv.urlBase + '/' + remoteName : '',
+      method: 'recovered',
+      origin: 'recovered',
+      time: new Date().toISOString(),
+      verifiedAt: Date.now(),
+    };
+  }
+
+  // 用远端清单对账本地 history（只在探测成功时调用）：
+  //   1) 有记录且远端在 → 刷新 verifiedAt、清 stale、校正 remoteName；
+  //   2) 有记录但远端无 → 标 stale（仅当该记录在本次探测开始前就已确认，避免把探测期间新上传误标）；
+  //   3) 本地有字节、远端有同 md5、却缺记录 → 补录 recovered（同 md5 只补“规范文件”一条）。
+  // probeStartedAt：本次探测发起时间，用于竞态判断。
+  function reconcileWithRemote(srv, files, probeStartedAt) {
+    var byMd5 = {};
+    (files || []).forEach(function (f) { if (f.md5) byMd5[f.md5] = f.name; });
+    var changed = false;
+
+    // 1) 已有记录的：确认 / 失效
+    libFiles.forEach(function (lf) {
+      var md5 = md5Of(lf.name);
+      if (!md5) return;
+      var remoteName = byMd5[md5];
+      var t = findTargetRec(lf.name, srv);
+      if (!t) return;
+      if (remoteName) {
+        if (t.stale) { delete t.stale; changed = true; }
+        if (t.remoteName !== remoteName) { t.remoteName = remoteName; changed = true; }
+        t.verifiedAt = Date.now();
+        changed = true;
+      } else if (!t.stale && (!t.verifiedAt || t.verifiedAt < probeStartedAt)) {
+        t.stale = true; // 远端已删：标记失效
+        changed = true;
+      }
+    });
+
+    // 2) 缺记录的：本地有字节 + 远端有同 md5 → 选“规范文件”补录（精确同名 > 最近修改）
+    var canonical = {}; // md5 -> { name, mtime, exact }
+    libFiles.forEach(function (lf) {
+      var md5 = md5Of(lf.name);
+      if (!md5 || !byMd5[md5]) return;
+      if (findTargetRec(lf.name, srv)) return; // 已有记录
+      var exact = lf.name === byMd5[md5];
+      var cur = canonical[md5];
+      if (!cur
+        || (exact && !cur.exact)
+        || (exact === cur.exact && String(lf.mtime) > String(cur.mtime))) {
+        canonical[md5] = { name: lf.name, mtime: lf.mtime, exact: exact };
+      }
+    });
+    Object.keys(canonical).forEach(function (md5) {
+      var lfName = canonical[md5].name;
+      var rec = history[lfName];
+      if (!rec || !Array.isArray(rec.targets)) {
+        rec = history[lfName] = { orig: origOf(lfName), targets: [] };
+      }
+      rec.targets.push(makeRecoveredTarget(srv, byMd5[md5]));
+      changed = true;
+    });
+
+    if (changed) saveJson(HISTORY_KEY, history);
+  }
+
+  // 记录探测状态到 servers[i].status（持久化“上次已知”，下次打开先显示再刷新）
+  function saveServerStatus(srv, patch) {
+    var s = serverById(srv.id);
+    if (!s) return;
+    s.status = s.status || {};
+    for (var k in patch) s.status[k] = patch[k];
+    s.status.lastProbe = Date.now();
+    saveJson(SERVERS_KEY, servers);
+  }
+
+  // 探测成功：落 remoteIndex、写状态、按目标对账
+  function applyProbe(srv, data, probeStartedAt) {
+    remoteIndex[targetKey(srv)] = { fetchedAt: Date.now(), files: data.files || [] };
+    saveJson(REMOTE_INDEX_KEY, remoteIndex);
+    saveServerStatus(srv, {
+      reachable: true,
+      dirExists: !!data.dirExists,
+      hasRsync: !!data.hasRsync,
+      error: '',
+    });
+    reconcileWithRemote(srv, data.files || [], probeStartedAt);
+  }
+
+  // 探测失败：只记状态，绝不改历史记录（否则会把整批记录误判为失效）
+  function markProbeError(srv, error) {
+    saveServerStatus(srv, { reachable: false, error: error || '探测失败' });
+  }
+
+  // 探测某服务器目标：30s 内复用缓存；force 时强制刷新；过期响应按 targetKey 丢弃
+  async function probeTarget(srv, force) {
+    if (!srv) return;
+    var key = targetKey(srv);
+    if (!force && probeState[key] && Date.now() - probeState[key].at < PROBE_TTL_MS) {
+      renderStatus();
+      return;
+    }
+    var seq = (probeSeq[key] || 0) + 1;
+    probeSeq[key] = seq;
+    probeBusy[key] = true;
+    renderStatus();
+    var startedAt = Date.now(); // 竞态基准：早于此刻确认过的记录，才允许被本次探测判为失效
+    var data = null;
+    try {
+      var p = new URLSearchParams();
+      p.set('host', srv.host);
+      p.set('user', srv.user || 'root');
+      p.set('dir', srv.dir);
+      var res = await fetch('/api/remote?' + p.toString());
+      var body = null;
+      try { body = await res.json(); } catch (e) { body = null; }
+      if (!res.ok || !body) throw new Error((body && body.error) || ('HTTP ' + res.status));
+      data = body;
+    } catch (e) {
+      data = { ok: false, error: (e && e.message) ? e.message : String(e) };
+    }
+    if (probeSeq[key] !== seq) return; // 已切到别的目标或发起了更新的探测：丢弃本次结果
+    probeBusy[key] = false;
+    probeState[key] = { at: Date.now(), data: data };
+    if (data.ok) applyProbe(srv, data, startedAt);
+    else markProbeError(srv, data.error);
+    renderStatus();
+    renderGrid();
+  }
+
+  // 当前目标的对账摘要：远端独有（远端有、本地无）与已缺失（history 标 stale）数量
+  function summaryFor(srv) {
+    var idx = remoteIndex[targetKey(srv)];
+    var remoteOnly = 0;
+    if (idx && Array.isArray(idx.files)) {
+      idx.files.forEach(function (f) {
+        if (f.md5 && !localNameByMd5(f.md5)) remoteOnly++;
+      });
+    }
+    var stale = 0;
+    Object.keys(history).forEach(function (k) {
+      var t = findTargetRec(k, srv);
+      if (t && t.stale) stale++;
+    });
+    return { remoteOnly: remoteOnly, stale: stale };
+  }
+
+  // 状态徽标：探测中 / 在线（可带目录缺失、scp 降级说明）/ 离线，并附对账摘要
+  function renderStatus() {
+    var srv = currentServer();
+    targetStatus.textContent = '';
+    targetStatus.className = '';
+    targetStatus.title = '';
+    cleanStaleBtn.hidden = true;
+    if (!srv) return;
+    var key = targetKey(srv);
+    if (probeBusy[key]) { targetStatus.textContent = '检测中…'; return; }
+    var s = serverById(srv.id);
+    var st = s && s.status;
+    if (!st) { targetStatus.textContent = '未探测'; return; }
+    if (!st.reachable) {
+      targetStatus.textContent = '离线';
+      targetStatus.className = 'offline';
+      targetStatus.title = st.error || '';
+      return;
+    }
+    var sum = summaryFor(srv);
+    var text = '在线';
+    if (!st.dirExists) text += '（目录不存在）';
+    else if (!st.hasRsync) text += '（scp）';
+    if (sum.remoteOnly) text += ' · 远端独有 ' + sum.remoteOnly;
+    if (sum.stale) text += ' · 已缺失 ' + sum.stale;
+    targetStatus.textContent = text;
+    targetStatus.className = 'online';
+    cleanStaleBtn.hidden = !sum.stale;
+  }
+
   // =============== 服务器配置管理 ===============
 
   // 生成服务器配置的唯一 id（历史记录与下拉选项靠它关联）
@@ -859,14 +1342,19 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       s.user = user;
       s.dir = dir;
       s.urlBase = urlBase;
+      delete s.status; // host/dir 可能已变：旧探测状态作废
     } else {
-      servers.push({ id: genId(), label: label, host: host, user: user, dir: dir, urlBase: urlBase });
+      s = { id: genId(), label: label, host: host, user: user, dir: dir, urlBase: urlBase };
+      servers.push(s);
     }
     saveJson(SERVERS_KEY, servers);
     resetForm();
     renderServerList();
     renderTargetSel();
     renderGrid(); // host/dir 变化会影响按目标过滤的结果
+    // 当前目标正是刚保存的这台时，立即强制探测一次（配置可能已变）
+    var cur = currentServer();
+    if (cur && cur.id === s.id) probeTarget(cur, true);
     hint('服务器配置已保存');
   });
 
@@ -889,6 +1377,26 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (srv.urlBase) p.set('urlBase', srv.urlBase);
     }
     return p;
+  }
+
+  // 剪贴板图片命名用时间戳：本地时间 YYYYMMDD_HHmmss（各段补零，便于人类一眼分辨）
+  function pasteStamp() {
+    var d = new Date();
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    return '' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate())
+      + '_' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  }
+
+  // 剪贴板图片的扩展名：优先按 MIME 类型推断，其次取原文件名扩展名，最后回退 png
+  // （扩展名决定服务端 Content-Type，缺失会导致缩略图按二进制流返回）
+  function pasteExt(file) {
+    var byMime = {
+      'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+      'image/webp': 'webp', 'image/bmp': 'bmp', 'image/svg+xml': 'svg',
+    };
+    if (file && file.type && byMime[file.type]) return byMime[file.type];
+    var m = /\.([A-Za-z0-9]+)$/.exec((file && file.name) || '');
+    return m ? m[1].toLowerCase() : 'png';
   }
 
   // 追加一行上传结果（文件名 + 状态区），返回状态区引用供更新
@@ -914,10 +1422,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       label: srv ? (srv.label || srv.host) : '本机',
       host: srv ? srv.host : '',
       dir: srv ? srv.dir : '',
+      remoteName: srv ? data.localName : '', // 推送时远端名与本地名一致
       remotePath: data.remotePath,
       url: data.url || '',
       method: data.method,
+      origin: 'push',
       time: new Date().toISOString(),
+      verifiedAt: Date.now(),
     };
     var entry = history[data.localName];
     if (!entry || !Array.isArray(entry.targets)) {
@@ -937,11 +1448,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 单文件上传：body 直接放 File 对象（浏览器按原始字节发送）
-  async function uploadOne(file, srv) {
-    var entry = addResultRow(file.name);
+  async function uploadOne(file, srv, name) {
+    name = name || file.name; // 未指定时沿用原始文件名（粘贴场景由调用方给 paste_<时间戳>）
+    var entry = addResultRow(name);
     try {
       var p = targetParams(srv);
-      p.set('name', file.name);
+      p.set('name', name);
       var res;
       try {
         res = await fetch('/upload?' + p.toString(), { method: 'POST', body: file });
@@ -955,7 +1467,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (!res.ok || !jsonOk || !data.ok) {
         throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
       }
-      recordUpload(data, file.name, srv);
+      recordUpload(data, name, srv);
 
       // 成功态：方式徽标 + 路径（有 URL 再加一行）+ 各自的复制按钮
       entry.status.textContent = '';
@@ -977,7 +1489,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 批量入口：过滤出图片后串行逐个上传（后端上传队列本身串行，前端逐个展示结果）
-  async function uploadFiles(fileList) {
+  // nameFor(file, index) 可选：为图片生成上传用文件名（如粘贴场景），缺省用原始文件名
+  async function uploadFiles(fileList, nameFor) {
     var files = [];
     var skipped = 0; // 非 image/* 文件计数，用于提示用户有文件被忽略
     for (var i = 0; i < fileList.length; i++) {
@@ -991,9 +1504,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (skipped) hint('已忽略 ' + skipped + ' 个非图片文件，仅上传 ' + files.length + ' 张图片', true);
     var srv = currentServer();
     for (var j = 0; j < files.length; j++) {
-      await uploadOne(files[j], srv);
+      var name = nameFor ? nameFor(files[j], j) : null;
+      await uploadOne(files[j], srv, name);
     }
-    refreshHistory(); // 全部完成后刷新历史区
+    refreshHistory(); // 全部完成后刷新图库
   }
 
   fileInput.addEventListener('change', function () {
@@ -1029,15 +1543,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     fileInput.click();
   });
 
-  // 粘贴截图：剪贴板里带文件对象时（系统截图 / 复制图片）触发上传
+  // 粘贴截图：剪贴板里带文件对象时（系统截图 / 复制图片）触发上传。
+  // 剪贴板图片通常没有有意义的文件名，统一命名 paste_<YYYYMMDD_HHmmss>.<ext>；
+  // 一次粘贴多张时共用同一时间戳，第 2 张起追加 _2、_3 区分。
   document.addEventListener('paste', function (e) {
     if (!e.clipboardData || !e.clipboardData.files || !e.clipboardData.files.length) return;
-    uploadFiles(e.clipboardData.files);
+    var stamp = pasteStamp();
+    var n = 0;
+    uploadFiles(e.clipboardData.files, function (file) {
+      n++;
+      return 'paste_' + stamp + (n === 1 ? '' : '_' + n) + '.' + pasteExt(file);
+    });
   });
 
-  // =============== 历史图库 ===============
+  // =============== 图库 ===============
 
-  // 历史区错误占位：拉取失败时显示中文提示，绝不动 localStorage 记录
+  // 图库区错误占位：拉取失败时显示中文提示，绝不动 localStorage 记录
   function showHistoryError(message) {
     historyCount.textContent = '';
     grid.textContent = '';
@@ -1076,6 +1597,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       showHistoryError(e && e.message ? e.message : String(e));
       return;
     }
+    // 图库刚加载完：若已有探测结果，补做一次对账，
+    // 避免「探测先于图库返回」时 #3（本地有、远端有、缺记录）漏补一轮
+    var cur = currentServer();
+    var cached = cur && probeState[targetKey(cur)];
+    if (cur && cached && cached.data && cached.data.ok) {
+      reconcileWithRemote(cur, cached.data.files || [], cached.at);
+    }
     reconcile();
     renderGrid();
   }
@@ -1091,24 +1619,45 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (changed) saveJson(HISTORY_KEY, history);
   }
 
-  // 过滤规则：选中服务器 → 只显示 targets 含该 host+dir 的文件；本机 → 全部
+  // 图库 = 当前目标下的全部图片：
+  //   本机   → 全部本地图；
+  //   服务器 → 该目标上存在的本地图（history ∪ remoteIndex）+ 远端独有（本地无副本）。
+  // 本地卡片在前（沿用图库的时间倒序），远端独有在后（按文件名）。
   function renderGrid() {
     var srv = currentServer();
-    // 无条件先同步「从图库补齐」按钮/抽屉：切到“还没图”的新目标时也必须解锁按钮
+    renderStatus(); // 状态徽标与对账摘要随目标刷新
+    // 无条件先同步「同步」按钮/抽屉：切到“还没图”的新目标时也必须解锁按钮
     refreshSyncArea();
-    var files = libFiles.filter(function (f) {
+
+    var locals = libFiles.filter(function (f) {
       if (!srv) return true;
-      var rec = history[f.name];
-      if (!rec || !Array.isArray(rec.targets)) return false;
-      return rec.targets.some(function (t) { return t.host === srv.host && t.dir === srv.dir; });
+      return targetHasMd5(srv, md5Of(f.name)); // history 记录或远端清单命中
     });
 
+    var remotes = [];
+    if (srv) {
+      var idx = remoteIndex[targetKey(srv)];
+      if (idx && Array.isArray(idx.files)) {
+        var seen = {};
+        idx.files.forEach(function (f) {
+          if (f.md5) {
+            if (localNameByMd5(f.md5)) return; // 本地已有同内容 → 走本地卡片
+            if (seen[f.md5]) return; // 同 md5 只展示一条
+            seen[f.md5] = true;
+          }
+          remotes.push(f); // 无 md5 的手工文件无法与本地去重，照常展示
+        });
+        remotes.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+      }
+    }
+
+    var total = locals.length + remotes.length;
     historyCount.textContent = srv
-      ? files.length + ' 张 · ' + (srv.label || srv.host)
-      : files.length + ' 张';
+      ? total + ' 张 · ' + (srv.label || srv.host)
+      : total + ' 张';
 
     grid.textContent = ''; // 清空重建（textContent 赋值不产生 XSS 面）
-    if (!files.length) {
+    if (!total) {
       var empty = document.createElement('p');
       empty.className = 'empty';
       empty.textContent = srv
@@ -1117,18 +1666,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       grid.appendChild(empty);
       return;
     }
-    files.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
+    locals.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
+    remotes.forEach(function (f) { grid.appendChild(makeRemoteCard(f, srv)); });
   }
 
-  // 「从图库补齐」联动：按钮可用性随是否选中服务器变化；抽屉开着时同步刷新列表
+  // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
   function refreshSyncArea() {
-    var srv = currentServer();
-    syncLibBtn.disabled = !srv || syncBusy;
-    if (!srv) {
-      if (syncDrawer.classList.contains('open')) closeDrawer(); // 切到本机/删配置：抽屉无可补目标，收起
-      return;
-    }
-    if (syncDrawer.classList.contains('open')) renderSyncList(); // 开着抽屉 → 按当前目标重绘缺项
+    syncLibBtn.disabled = syncBusy;
+    if (syncDrawer.classList.contains('open')) renderSyncList();
   }
 
   function makeCard(f, srv) {
@@ -1153,10 +1698,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var body = document.createElement('div');
     body.className = 'card-body';
 
-    // 原名优先取历史记录；无记录时从存储名 <md5>-原名 中截取（第 34 个字符起）
+    // 展示名随当前目标：本机用本地原名；服务器用该目标上的远端名
     var orig = document.createElement('div');
     orig.className = 'orig';
-    orig.textContent = (rec && rec.orig) ? rec.orig : f.name.substring(33);
+    orig.textContent = nameOnTarget(f.name, srv);
     body.appendChild(orig);
 
     var meta = document.createElement('div');
@@ -1166,7 +1711,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     // 推送记录：本机视图显示全部记录；选中服务器时只显示该服务器的记录
     var records = (rec && Array.isArray(rec.targets))
-      ? rec.targets.filter(function (t) { return !srv || (t.host === srv.host && t.dir === srv.dir); })
+      ? rec.targets.filter(function (x) { return !srv || (x.host === srv.host && x.dir === srv.dir); })
       : [];
     var list = document.createElement('div');
     list.className = 'targets';
@@ -1176,7 +1721,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       none.textContent = srv ? '尚未推送到该服务器' : '无推送记录（仅本机预览）';
       list.appendChild(none);
     } else {
-      records.forEach(function (t) { list.appendChild(makeTargetRow(t)); });
+      records.forEach(function (x) { list.appendChild(makeTargetRow(x, f.name)); });
     }
     body.appendChild(list);
 
@@ -1186,7 +1731,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.type = 'button';
     del.className = 'danger';
     del.textContent = '删除';
-    del.addEventListener('click', function () { removeFile(f.name, orig.textContent); });
+    del.addEventListener('click', function () { removeFile(f.name, srv); });
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -1194,14 +1739,93 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return card;
   }
 
-  // 单条推送记录：徽标 + 目标名 + 时间，路径 / URL 各带复制按钮
-  function makeTargetRow(t) {
+  // 远端独有卡片（本地无副本）：缩略图按需从目标读取；操作只有复制远端路径与删除远端文件
+  function makeRemoteCard(item, srv) {
+    var remotePath = srv.dir + '/' + item.name;
+
+    var card = document.createElement('div');
+    card.className = 'card';
+
+    var link = document.createElement('a');
+    link.className = 'thumb';
+    link.href = itemThumbUrl(item, srv);
+    link.target = '_blank';
+    link.rel = 'noopener';
+    var img = document.createElement('img');
+    img.src = link.href;
+    img.alt = item.name;
+    img.loading = 'lazy';
+    link.appendChild(img);
+    card.appendChild(link);
+
+    var body = document.createElement('div');
+    body.className = 'card-body';
+
+    var orig = document.createElement('div');
+    orig.className = 'orig';
+    orig.textContent = origFromName(item.name);
+    body.appendChild(orig);
+
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = '远端文件（本地无副本）';
+    body.appendChild(meta);
+
+    // 目标行：与历史卡的目标行同构，展示该目标上的远端路径与复制按钮
+    var list = document.createElement('div');
+    list.className = 'targets';
+    var row = document.createElement('div');
+    row.className = 'target';
+    var head = document.createElement('div');
+    head.className = 'target-head';
+    // 「远端独有」徽标置于目标行、服务器名之前
+    head.appendChild(makeStateBadge('remote-only', '远端独有'));
+    var label = document.createElement('span');
+    label.className = 'target-label';
+    label.textContent = srv.label || srv.host;
+    head.appendChild(label);
+    row.appendChild(head);
+    var pathLine = document.createElement('div');
+    pathLine.className = 'target-line';
+    var code = document.createElement('code');
+    code.textContent = remotePath;
+    pathLine.appendChild(code);
+    pathLine.appendChild(makeCopyButton(function () { return remotePath; }));
+    row.appendChild(pathLine);
+    list.appendChild(row);
+    body.appendChild(list);
+
+    var ops = document.createElement('div');
+    ops.className = 'card-ops';
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', function () { removeRemoteOnly(item, srv); });
+    ops.appendChild(del);
+    body.appendChild(ops);
+
+    card.appendChild(body);
+    return card;
+  }
+
+  // 卡片状态徽标（远端独有 / 远端已删）
+  function makeStateBadge(kind, text) {
+    var b = document.createElement('span');
+    b.className = 'badge badge-' + kind;
+    b.textContent = text;
+    return b;
+  }
+
+  // 单条推送记录：状态徽标（远端已删）+ 目标名 + 时间，路径 / URL 各带复制按钮
+  function makeTargetRow(t, localName) {
     var row = document.createElement('div');
     row.className = 'target';
 
     var head = document.createElement('div');
     head.className = 'target-head';
-    head.appendChild(makeMethodBadge(t.method));
+    // 图库卡片只展示状态：记录在、远端文件已被删时标「远端已删」
+    if (t.stale) head.appendChild(makeStateBadge('stale', '远端已删'));
     var label = document.createElement('span');
     label.className = 'target-label';
     label.textContent = t.label || (t.host || '本机');
@@ -1220,6 +1844,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     pathLine.appendChild(makeCopyButton(function () { return t.remotePath; }));
     row.appendChild(pathLine);
 
+    // 远端名与本地名不同时显式标注，让“同内容不同名”可见
+    if (localName && t.remoteName && t.remoteName !== localName) {
+      var note = document.createElement('div');
+      note.className = 'target-none';
+      note.textContent = '远端名 ' + origFromName(t.remoteName);
+      row.appendChild(note);
+    }
+
     if (t.url) {
       var urlLine = document.createElement('div');
       urlLine.className = 'target-line';
@@ -1232,24 +1864,211 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return row;
   }
 
-  // 删除：确认后调 DELETE /files/<name>，成功后清掉对应历史记录并刷新
-  async function removeFile(name, display) {
-    if (!window.confirm('确定删除「' + display + '」吗？将同时删除本机文件与全部推送记录。')) return;
-    try {
-      var res = await fetch('/files/' + encodeURIComponent(name), { method: 'DELETE' });
-      var data = {};
-      var jsonOk = true;
-      try { data = await res.json(); } catch (e) { jsonOk = false; } // 非 JSON 响应按失败处理
-      if (!res.ok || !jsonOk || !data.ok) {
-        throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
+  // =============== 确认弹窗与删除 ===============
+
+  // 通用确认弹窗：返回 Promise<{confirmed, checked}>。
+  // window.confirm 放不下复选项（本机删除的级联选项），故自绘一个轻量模态。
+  function showConfirm(opts) {
+    return new Promise(function (resolve) {
+      confirmTitle.textContent = opts.title || '确认';
+      confirmMsg.textContent = opts.message || '';
+      if (opts.checkboxLabel) {
+        confirmCheckWrap.hidden = false;
+        confirmCheckLabel.textContent = opts.checkboxLabel;
+        confirmCheck.checked = false;
+      } else {
+        confirmCheckWrap.hidden = true;
       }
-      delete history[name];
-      saveJson(HISTORY_KEY, history);
-      refreshHistory();
-      hint('已删除');
+      confirmOk.textContent = opts.okText || '删除';
+      confirmMask.hidden = false;
+      confirmOk.focus();
+
+      function cleanup() {
+        confirmMask.hidden = true;
+        confirmOk.removeEventListener('click', onOk);
+        confirmCancel.removeEventListener('click', onCancel);
+        document.removeEventListener('keydown', onKey);
+        confirmMask.removeEventListener('click', onMask);
+      }
+      function onOk() { cleanup(); resolve({ confirmed: true, checked: confirmCheck.checked }); }
+      function onCancel() { cleanup(); resolve({ confirmed: false, checked: false }); }
+      function onKey(e) {
+        if (e.key === 'Escape') onCancel();
+        else if (e.key === 'Enter') onOk();
+      }
+      function onMask(e) { if (e.target === confirmMask) onCancel(); }
+
+      confirmOk.addEventListener('click', onOk);
+      confirmCancel.addEventListener('click', onCancel);
+      document.addEventListener('keydown', onKey);
+      confirmMask.addEventListener('click', onMask);
+    });
+  }
+
+  // 删除远端目标上的单个文件（DELETE /api/remote-file）
+  async function remoteDelete(srv, remoteName) {
+    var p = new URLSearchParams();
+    p.set('host', srv.host);
+    p.set('user', srv.user || 'root');
+    p.set('dir', srv.dir);
+    p.set('name', remoteName);
+    var res;
+    try {
+      res = await fetch('/api/remote-file?' + p.toString(), { method: 'DELETE' });
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+  }
+
+  // 删除本机文件（DELETE /files/<name>）
+  async function deleteLocal(name) {
+    var res;
+    try {
+      res = await fetch('/files/' + encodeURIComponent(name), { method: 'DELETE' });
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+  }
+
+  // 从本地 history 移除某目标记录；本地条目保留（仍可作本机预览）
+  function dropTargetRecord(name, srv) {
+    var rec = history[name];
+    if (!rec || !Array.isArray(rec.targets)) return;
+    rec.targets = rec.targets.filter(function (t) {
+      return !(t.host === srv.host && t.dir === srv.dir);
+    });
+    saveJson(HISTORY_KEY, history);
+  }
+
+  // 从 remoteIndex 缓存移除某文件名（删远端后保持缓存一致）
+  function dropRemoteIndexFile(srv, remoteName) {
+    var idx = remoteIndex[targetKey(srv)];
+    if (!idx || !Array.isArray(idx.files)) return;
+    idx.files = idx.files.filter(function (f) { return f.name !== remoteName; });
+    saveJson(REMOTE_INDEX_KEY, remoteIndex);
+  }
+
+  // 按 host+dir 找服务器配置（历史记录里的目标可能已从配置中删除，故允许为空）
+  function serverByHostDir(host, dir) {
+    for (var i = 0; i < servers.length; i++) {
+      if (servers[i].host === host && servers[i].dir === dir) return servers[i];
+    }
+    return null;
+  }
+
+  // 收集“该本地文件在各服务器上的副本”（本机级联删除用）：
+  // 来源 = history 各 target 记录 + remoteIndex 中同 md5 的清单，按 host+dir 去重。
+  function serverCopies(name) {
+    var md5 = md5Of(name);
+    var copies = [];
+    var seen = {};
+    function add(host, dir, remoteName) {
+      if (!host || !dir || !remoteName) return;
+      var k = host + '|' + dir;
+      if (seen[k]) return;
+      seen[k] = true;
+      var srv = serverByHostDir(host, dir);
+      copies.push({
+        host: host,
+        dir: dir,
+        user: (srv && srv.user) || 'root',
+        remoteName: remoteName,
+        label: (srv && (srv.label || srv.host)) || host,
+      });
+    }
+    var rec = history[name];
+    if (rec && Array.isArray(rec.targets)) {
+      rec.targets.forEach(function (t) { add(t.host, t.dir, t.remoteName || baseName(t.remotePath)); });
+    }
+    if (md5) {
+      Object.keys(remoteIndex).forEach(function (k) {
+        var idx = remoteIndex[k];
+        if (!idx || !Array.isArray(idx.files)) return;
+        idx.files.forEach(function (f) {
+          if (f.md5 !== md5) return;
+          var parts = k.split('|');
+          add(parts[0], parts[1], f.name);
+        });
+      });
+    }
+    return copies;
+  }
+
+  // 删除入口：按当前目标作用域分派
+  async function removeFile(name, srv) {
+    if (srv) return removeFromServer(name, srv);
+    return removeFromLocal(name);
+  }
+
+  // 服务器作用域删除：只删该目标的远端文件与记录，本地文件与其他目标记录保留
+  async function removeFromServer(name, srv) {
+    var t = findTargetRec(name, srv);
+    var remoteName = (t && (t.remoteName || baseName(t.remotePath))) || name;
+    var r = await showConfirm({
+      title: '删除远端文件',
+      message: '确定从「' + (srv.label || srv.host) + '」删除「' + nameOnTarget(name, srv) +
+        '」吗？将同时删除该服务器上的文件与该目标的推送记录。',
+    });
+    if (!r.confirmed) return;
+    try {
+      await remoteDelete(srv, remoteName);
     } catch (err) {
       window.alert('删除失败：' + (err.message || err));
+      return;
     }
+    dropTargetRecord(name, srv);
+    dropRemoteIndexFile(srv, remoteName);
+    hint('已从 ' + (srv.label || srv.host) + ' 删除');
+    refreshHistory();
+  }
+
+  // 本机作用域删除：删本地文件；可选级联删除所有服务器副本（远端先行、全成才删本地）
+  async function removeFromLocal(name) {
+    var copies = serverCopies(name);
+    var opts = { title: '删除本地文件', message: '确定删除本地文件「' + origOf(name) + '」吗？' };
+    if (copies.length) opts.checkboxLabel = '同时删除所有服务器上的副本（' + copies.length + ' 台）';
+    var r = await showConfirm(opts);
+    if (!r.confirmed) return;
+
+    if (r.checked && copies.length) {
+      var failed = [];
+      for (var i = 0; i < copies.length; i++) {
+        try {
+          await remoteDelete(copies[i], copies[i].remoteName);
+        } catch (e) {
+          failed.push(copies[i].label + '（' + (e.message || e) + '）');
+        }
+      }
+      if (failed.length) {
+        // 有远端未删成：中止本机删除，保留本地文件便于重试
+        // 注意：页面 JS 位于外层模板字符串内，禁用反斜杠转义，换行用 String.fromCharCode(10)
+        var nl = String.fromCharCode(10);
+        window.alert('以下服务器删除失败，已中止本机删除：' + nl + failed.join(nl));
+        return;
+      }
+      copies.forEach(function (c) { dropRemoteIndexFile(c, c.remoteName); });
+    }
+
+    try {
+      await deleteLocal(name);
+    } catch (err) {
+      window.alert('删除失败：' + (err.message || err));
+      return;
+    }
+    delete history[name];
+    saveJson(HISTORY_KEY, history);
+    hint('已删除');
+    refreshHistory();
   }
 
   // =============== 从图库补齐抽屉 ===============
@@ -1261,14 +2080,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var entry = history[name];
     if (entry && entry.orig) return entry.orig;
     return name.length > 33 ? name.slice(33) : name;
-  }
-
-  // 该图是否已推送到目标 srv（按 host+dir 判定，与左栏过滤规则一致）
-  function isOnTarget(name, srv) {
-    if (!srv) return true;
-    var rec = history[name];
-    if (!rec || !Array.isArray(rec.targets)) return false;
-    return rec.targets.some(function (t) { return t.host === srv.host && t.dir === srv.dir; });
   }
 
   // 组装 /sync 的 query
@@ -1313,34 +2124,173 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     syncSelBtn.textContent = '同步选中(' + n + ')';
   }
 
-  // 单行推送（行内按钮）
-  async function syncOneRow(name, f, btn, errEl) {
+  // 抽屉来源选项：目标为服务器时 = 本地 + 其他服务器；目标为本机时 = 各服务器
+  function sourceOptions() {
+    var target = currentServer();
+    var list = [];
+    if (target) list.push({ value: 'local', label: '本地图库' });
+    servers.forEach(function (s) {
+      if (target && s.id === target.id) return; // 来源不能等于目标
+      list.push({ value: s.id, label: s.label || s.host });
+    });
+    return list;
+  }
+
+  // 重绘来源下拉，尽量保持原选择
+  function renderSourceSel() {
+    var opts = sourceOptions();
+    var prev = syncSourceSel.value;
+    syncSourceSel.textContent = '';
+    opts.forEach(function (o) {
+      var el = document.createElement('option');
+      el.value = o.value;
+      el.textContent = o.label;
+      syncSourceSel.appendChild(el);
+    });
+    var keep = opts.some(function (o) { return o.value === prev; }) ? prev : (opts[0] && opts[0].value) || '';
+    syncSourceSel.value = keep;
+  }
+
+  // 来源清单：本地来源取图库；服务器来源取 remoteIndex 缓存（未探测返回 null）
+  function sourceFiles() {
+    if (syncSourceSel.value === 'local') {
+      return libFiles.map(function (f) {
+        return { name: f.name, md5: md5Of(f.name), size: f.size, mtime: f.mtime, local: true };
+      });
+    }
+    var srv = serverById(syncSourceSel.value);
+    if (!srv) return [];
+    var idx = remoteIndex[targetKey(srv)];
+    if (!idx || !Array.isArray(idx.files)) return null; // 未探测
+    return idx.files.map(function (f) { return { name: f.name, md5: f.md5, local: false }; });
+  }
+
+  // 目标是否已有该 md5：本机看本地图库；服务器看 history 记录 ∪ remoteIndex 清单
+  // （同步/上传成功只写 history，若只看 remoteIndex 会导致抽屉条目不消失）
+  function targetHasMd5(srv, md5) {
+    if (!md5) return false;
+    if (!srv) return !!localNameByMd5(md5);
+    if (Object.keys(history).some(function (k) {
+      return md5Of(k) === md5 && findTargetRec(k, srv);
+    })) return true;
+    var idx = remoteIndex[targetKey(srv)];
+    if (idx && Array.isArray(idx.files)) return idx.files.some(function (f) { return f.md5 === md5; });
+    return false;
+  }
+
+  // 抽屉待同步项 = 来源清单里「目标还没有」的条目（同 md5 只保留一条）
+  function missingItems() {
+    var target = currentServer();
+    var files = sourceFiles();
+    if (files === null) return null; // 来源服务器尚未探测
+    var seen = {};
+    var out = [];
+    files.forEach(function (f) {
+      if (targetHasMd5(target, f.md5)) return;
+      if (f.md5) {
+        if (seen[f.md5]) return; // 同内容多副本：只展示一条
+        seen[f.md5] = true;
+      }
+      out.push(f);
+    });
+    return out;
+  }
+
+  // 抽屉条目缩略图：本地有字节走 /files/；否则按需从来源服务器读取（懒加载 + 服务端缓存）
+  function itemThumbUrl(item, srcSrv) {
+    var localName = item.md5 ? localNameByMd5(item.md5) : null;
+    if (localName) return '/files/' + encodeURIComponent(localName);
+    if (srcSrv) {
+      var p = new URLSearchParams();
+      p.set('host', srcSrv.host);
+      p.set('user', srcSrv.user || 'root');
+      p.set('dir', srcSrv.dir);
+      p.set('name', item.name);
+      return '/api/remote-file?' + p.toString();
+    }
+    return '/files/' + encodeURIComponent(item.name);
+  }
+
+  // 从来源服务器拉回单个文件到本地图库（POST /pull），返回 {localName, remoteName}
+  async function pullOne(name, srcSrv) {
+    var p = new URLSearchParams();
+    p.set('name', name);
+    p.set('host', srcSrv.host);
+    p.set('user', srcSrv.user || 'root');
+    p.set('dir', srcSrv.dir);
+    var res;
+    try {
+      res = await fetch('/pull?' + p.toString(), { method: 'POST' });
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+    return data;
+  }
+
+  // 同步单个抽屉条目：
+  //   目标本机   → 从来源拉回本地即完成；
+  //   目标服务器 → 先确保本地有字节（必要时拉回），再推送到目标（统一用本地名）。
+  async function syncDrawerItem(item, srcSrv, target) {
+    var localName = item.md5 ? localNameByMd5(item.md5) : null;
+    if (!localName && srcSrv) {
+      var pulled = await pullOne(item.name, srcSrv);
+      localName = pulled.localName;
+    }
+    if (!localName) localName = item.name; // 本地来源：item.name 即本地名
+    if (!target) return; // 目标就是本机：拉回即完成
+    await doSyncOne(localName, target);
+  }
+
+  // 单行同步（行内按钮）
+  async function syncItemRow(item, srcSrv, target, btn, errEl) {
     if (syncBusy) return;
-    var srv = currentServer();
-    if (!srv) return;
     btn.disabled = true;
     btn.textContent = '同步中…';
     if (errEl) errEl.textContent = '';
     try {
-      await doSyncOne(name, srv);
-      delete syncSelected[name];
-      renderGrid(); // 左栏刷新（renderGrid 内部会联动重绘抽屉，本行自然消失）
-      hint('已推送到 ' + (srv.label || srv.host));
+      await syncDrawerItem(item, srcSrv, target);
+      delete syncSelected[item.name];
+      refreshHistory();
+      hint(target ? ('已同步到 ' + (target.label || target.host)) : '已拉回本地');
     } catch (e) {
       btn.disabled = false;
-      btn.textContent = '推送';
+      btn.textContent = '同步';
       var msgText = e.message || String(e);
       if (errEl) errEl.textContent = msgText;
       hint(msgText, true);
     }
   }
 
-  // 构建一个「缺项」卡片：展示与历史图库一致（大缩略图 + 原名 + 大小/时间 + 操作行），单列
-  function buildSyncCard(f, srv) {
+  // 删除「远端独有（本地无副本）」条目：只删远端文件与 remoteIndex 条目
+  async function removeRemoteOnly(item, srcSrv) {
+    var r = await showConfirm({
+      title: '删除远端文件',
+      message: '确定从「' + (srcSrv.label || srcSrv.host) + '」删除「' + origFromName(item.name) + '」吗？将删除该服务器上的文件。',
+    });
+    if (!r.confirmed) return;
+    try {
+      await remoteDelete(srcSrv, item.name);
+    } catch (err) {
+      window.alert('删除失败：' + (err.message || err));
+      return;
+    }
+    dropRemoteIndexFile(srcSrv, item.name);
+    hint('已删除');
+    refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
+  }
+
+  // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步 / 删除远端独有）
+  function buildSyncCard(item, srcSrv, target) {
     var card = document.createElement('div');
     card.className = 'card sync-card';
 
-    var href = '/files/' + encodeURIComponent(f.name);
+    var localName = item.md5 ? localNameByMd5(item.md5) : null;
+    var href = itemThumbUrl(item, srcSrv);
 
     // 大缩略图：点击新窗口打开原图（同历史卡片）
     var link = document.createElement('a');
@@ -1350,7 +2300,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     link.rel = 'noopener';
     var img = document.createElement('img');
     img.src = href;
-    img.alt = f.name;
+    img.alt = item.name;
     img.loading = 'lazy';
     link.appendChild(img);
     card.appendChild(link);
@@ -1358,27 +2308,29 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var body = document.createElement('div');
     body.className = 'card-body';
 
-    // 原名 + 大小/时间：与历史卡一致
+    // 名称随来源：抽屉里展示来源上的原名
     var origEl = document.createElement('div');
     origEl.className = 'orig';
-    origEl.textContent = origOf(f.name);
+    origEl.textContent = origFromName(item.name);
     body.appendChild(origEl);
 
     var meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = formatSize(f.size) + ' · ' + formatTime(f.mtime);
+    meta.textContent = item.local
+      ? (formatSize(item.size) + ' · ' + formatTime(item.mtime))
+      : '远端文件（本地无副本）';
     body.appendChild(meta);
 
-    // 状态行：对齐历史卡「该目标记录」语义；此目标还没有记录 → 显示尚未推送
+    // 状态行：说明这次同步会把条目送到哪里
     var list = document.createElement('div');
     list.className = 'targets';
     var none = document.createElement('div');
     none.className = 'target-none';
-    none.textContent = '尚未推送到 ' + (srv.label || srv.host);
+    none.textContent = target ? ('尚未同步到 ' + (target.label || target.host)) : '尚未拉回本地';
     list.appendChild(none);
     body.appendChild(list);
 
-    // 操作行：左侧「勾选」+ 右侧「推送」
+    // 操作行：左侧勾选 + 右侧同步（远端独有再加删除）
     var ops = document.createElement('div');
     ops.className = 'card-ops';
 
@@ -1386,12 +2338,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     lab.className = 'sync-check';
     var check = document.createElement('input');
     check.type = 'checkbox';
-    check.checked = !!syncSelected[f.name];
+    check.checked = !!syncSelected[item.name];
     check.disabled = syncBusy;
     check.addEventListener('change', function () {
       if (syncBusy) { check.checked = !check.checked; return; }
-      if (check.checked) syncSelected[f.name] = true;
-      else delete syncSelected[f.name];
+      if (check.checked) syncSelected[item.name] = true;
+      else delete syncSelected[item.name];
       updateSyncSelBtn();
     });
     lab.appendChild(check);
@@ -1400,38 +2352,67 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var btn = document.createElement('button');
     btn.type = 'button';
-    btn.textContent = '推送';
+    btn.textContent = '同步';
     var errEl = document.createElement('span');
     errEl.className = 'sync-err';
-    btn.addEventListener('click', function () { syncOneRow(f.name, f, btn, errEl); });
+    btn.addEventListener('click', function () { syncItemRow(item, srcSrv, target, btn, errEl); });
     ops.appendChild(btn);
+
+    // 远端独有（本地无字节）时提供删除：只删远端文件
+    if (srcSrv && !localName) {
+      var delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'danger';
+      delBtn.textContent = '删除';
+      delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv); });
+      ops.appendChild(delBtn);
+    }
     body.appendChild(ops);
 
-    // 失败提示行（成功时留空，整卡由 renderGrid→renderSyncList 移除）
     body.appendChild(errEl);
-
     card.appendChild(body);
     return card;
   }
 
-  // 重绘抽屉列表（缺项集 = 图库 − 已推到当前目标）
+  // 重绘抽屉列表：来源清单里「目标还没有」的条目
   function renderSyncList() {
-    var srv = currentServer();
-    syncTitle.textContent = srv ? '补齐到 ' + (srv.label || srv.host) : '补齐到…';
+    renderSourceSel();
+    var target = currentServer();
+    var srcSrv = syncSourceSel.value === 'local' ? null : serverById(syncSourceSel.value);
+    var srcLabel = srcSrv ? (srcSrv.label || srcSrv.host) : '本地图库';
+    var tgtLabel = target ? (target.label || target.host) : '本机';
+    syncTitle.textContent = srcLabel + ' → ' + tgtLabel;
     syncList.textContent = '';
-    if (!srv) return;
-    var missing = libFiles.filter(function (f) { return !isOnTarget(f.name, srv); });
+
+    var missing = missingItems();
+    if (missing === null) {
+      // 来源服务器还没探测：给一个手动探测入口
+      var tip = document.createElement('p');
+      tip.className = 'sync-empty';
+      tip.textContent = '尚未获取「' + srcLabel + '」的清单';
+      var probeBtn = document.createElement('button');
+      probeBtn.type = 'button';
+      probeBtn.textContent = '探测';
+      probeBtn.addEventListener('click', function () { probeTarget(srcSrv, true); });
+      tip.appendChild(document.createElement('br'));
+      tip.appendChild(probeBtn);
+      syncList.appendChild(tip);
+      syncSelAll.textContent = '全选';
+      syncSelAll.disabled = true;
+      updateSyncSelBtn();
+      return;
+    }
     if (!missing.length) {
       var empty = document.createElement('p');
       empty.className = 'sync-empty';
-      empty.textContent = '图库中所有图片都已同步到该目标';
+      empty.textContent = srcLabel + ' 中所有图片都已同步到 ' + tgtLabel;
       syncList.appendChild(empty);
       syncSelAll.textContent = '全选';
       syncSelAll.disabled = true;
       updateSyncSelBtn();
       return;
     }
-    missing.forEach(function (f) { syncList.appendChild(buildSyncCard(f, srv)); });
+    missing.forEach(function (item) { syncList.appendChild(buildSyncCard(item, srcSrv, target)); });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     syncSelAll.textContent = allChecked ? '取消全选' : '全选';
@@ -1439,13 +2420,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     updateSyncSelBtn();
   }
 
-  // 打开抽屉（仅当已选服务器目标；本机无意义）：加 .open 触发右滑入动画
+  // 打开抽屉：加 .open 触发右滑入动画；来源服务器未探测时自动探一次
   function openDrawer() {
-    var srv = currentServer();
-    if (!srv) { hint('请先选择目标服务器，再从图库补齐', true); return; }
+    if (!sourceOptions().length) {
+      hint('还没有可选的来源：请先在「⚙ 管理」里添加服务器', true);
+      return;
+    }
     syncSelected = {};
     syncDrawer.classList.add('open');
     renderSyncList();
+    var srcSrv = syncSourceSel.value === 'local' ? null : serverById(syncSourceSel.value);
+    if (srcSrv && !remoteIndex[targetKey(srcSrv)]) probeTarget(srcSrv, false);
   }
 
   function closeDrawer() {
@@ -1455,10 +2440,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 全选/取消全选：作用域是「当前缺项集」
   syncSelAll.addEventListener('click', function () {
-    var srv = currentServer();
-    if (!srv || syncBusy) return;
-    var missing = libFiles.filter(function (f) { return !isOnTarget(f.name, srv); });
-    if (!missing.length) return;
+    if (syncBusy) return;
+    var missing = missingItems();
+    if (!missing || !missing.length) return;
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     missing.forEach(function (f) {
       if (allChecked) delete syncSelected[f.name];
@@ -1467,12 +2451,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     renderSyncList();
   });
 
-  // 批量同步选中：串行逐张，期间锁定控件
+  // 批量同步选中：串行逐条，期间锁定控件
   syncSelBtn.addEventListener('click', async function () {
-    var srv = currentServer();
-    if (!srv || syncBusy) return;
-    var pending = [];
-    for (var k in syncSelected) { if (syncSelected[k]) pending.push(k); }
+    if (syncBusy) return;
+    var target = currentServer();
+    var srcSrv = syncSourceSel.value === 'local' ? null : serverById(syncSourceSel.value);
+    var missing = missingItems();
+    if (!missing) return;
+    var pending = missing.filter(function (f) { return syncSelected[f.name]; });
     if (!pending.length) return;
     syncBusy = true;
     syncLibBtn.disabled = true;
@@ -1483,8 +2469,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     for (var i = 0; i < pending.length; i++) {
       syncSelBtn.textContent = '同步中 ' + (i + 1) + '/' + pending.length;
       try {
-        await doSyncOne(pending[i], srv);
-        delete syncSelected[pending[i]];
+        await syncDrawerItem(pending[i], srcSrv, target);
+        delete syncSelected[pending[i].name];
         ok++;
       } catch (e) {
         fail++;
@@ -1493,23 +2479,61 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     syncBusy = false;
     syncList.style.pointerEvents = '';
     syncSelAll.disabled = false;
-    syncLibBtn.disabled = !currentServer();
-    renderGrid();
-    if (fail) hint('补齐完成：成功 ' + ok + ' 张，失败 ' + fail + ' 张', true);
-    else hint('已补齐 ' + ok + ' 张到 ' + (srv.label || srv.host));
+    syncLibBtn.disabled = false;
+    refreshHistory(); // pull 可能新增本地文件，重新拉图库
+    if (fail) hint('同步完成：成功 ' + ok + ' 张，失败 ' + fail + ' 张', true);
+    else hint('已同步 ' + ok + ' 张到 ' + (target ? (target.label || target.host) : '本机'));
   });
+
+  // 清理当前目标下所有「远端已删」的记录（只清本地记录，不动远端与本地文件）
+  async function cleanStale() {
+    var srv = currentServer();
+    if (!srv) return;
+    var staleNames = [];
+    Object.keys(history).forEach(function (k) {
+      var t = findTargetRec(k, srv);
+      if (t && t.stale) staleNames.push(k);
+    });
+    if (!staleNames.length) return;
+    var r = await showConfirm({
+      title: '清理失效记录',
+      message: '确定清理「' + (srv.label || srv.host) + '」下 ' + staleNames.length +
+        ' 条远端已删的记录吗？（只清本地记录，不影响远端与本地文件）',
+      okText: '清理',
+    });
+    if (!r.confirmed) return;
+    staleNames.forEach(function (k) { dropTargetRecord(k, srv); });
+    hint('已清理 ' + staleNames.length + ' 条失效记录');
+    refreshHistory();
+  }
 
   syncLibBtn.addEventListener('click', openDrawer);
   syncClose.addEventListener('click', closeDrawer);
+  syncSourceSel.addEventListener('change', function () {
+    var srcSrv = syncSourceSel.value === 'local' ? null : serverById(syncSourceSel.value);
+    renderSyncList();
+    if (srcSrv && !remoteIndex[targetKey(srcSrv)]) probeTarget(srcSrv, false);
+  });
+  cleanStaleBtn.addEventListener('click', cleanStale);
+  recheckBtn.addEventListener('click', function () {
+    var srv = currentServer();
+    if (!srv) { hint('当前是本机目标，无需对账', true); return; }
+    probeTarget(srv, true);
+  });
 
   // =============== 初始化 ===============
-  // 用户切换目标：记住选择（localStorage）并按该目标过滤历史
+  // 用户切换目标：记住选择、按该目标过滤历史；切到服务器目标时异步探测+对账
   targetSel.addEventListener('change', function () {
     saveJson(TARGET_KEY, targetSel.value);
     renderGrid();
+    var srv = currentServer();
+    if (srv) probeTarget(srv, false);
   });
   renderTargetSel();
   refreshHistory();
+  // 页面加载：对上次记住的服务器目标探测一次
+  var initSrv = currentServer();
+  if (initSrv) probeTarget(initSrv, false);
 })();
 </script>
 </body>
@@ -1717,6 +2741,202 @@ async function handleSync(req, res, params, ctx) {
   });
 }
 
+/**
+ * GET /api/remote?host=&user=&dir=
+ * 探测目标可达性、目录存在性与 rsync 能力，并列出目录内文件名（对账用）。
+ * 约定：ssh 失败返回 ok:false，前端忽略本次合并；目录不存在返回 ok:true 且清单为空。
+ */
+async function handleRemoteList(res, params) {
+  const pt = parseTargetParams(params);
+  if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
+  const { host, user, dir } = pt.target;
+
+  let r;
+  try {
+    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, buildRemoteListScript(dir)], PROBE_TIMEOUT_MS);
+  } catch (err) {
+    return sendJson(res, 200, { ok: false, error: err.message || '探测失败' });
+  }
+  if (r.code !== 0) {
+    return sendJson(res, 200, {
+      ok: false,
+      error: `ssh 探测失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`,
+    });
+  }
+  const parsed = parseRemoteList(r.stdout);
+  return sendJson(res, 200, {
+    ok: true,
+    dirExists: parsed.dirExists,
+    hasRsync: parsed.hasRsync,
+    files: parsed.files,
+  });
+}
+
+/** 以流式回放本地文件（缩略图/预览用），Content-Type 按扩展名推断 */
+function sendFile(res, filePath, name) {
+  res.writeHead(200, { 'Content-Type': mimeOf(name) });
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', () => res.destroy()); // 读流出错：直接断开，避免挂起
+  stream.pipe(res);
+}
+
+/** 在本地图库中查找指定 md5 的已有文件（同内容不同原名皆可），返回文件名或 null */
+async function findLocalByMd5(snapDir, md5) {
+  const entries = await fs.promises.readdir(snapDir).catch(() => []);
+  return entries.find((n) => isValidStoredName(n) && md5OfName(n) === md5) || null;
+}
+
+/**
+ * 远端缩略图缓存路径：文件名前掺入 host|dir 的短 hash。
+ * 不同目标下同名文件（尤其是不带 md5 前缀的手工文件）内容可能不同，
+ * 只用文件名做键会互相覆盖、串图，因此把目标身份也纳入键。
+ */
+function remoteCachePath(snapDir, host, dir, name) {
+  const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
+  return path.join(snapDir, '.remote-cache', `${key}-${name}`);
+}
+
+/**
+ * GET /api/remote-file?host=&user=&dir=&name=
+ * 按需从远端读取单个文件字节（缩略图/预览）：
+ *   1) 命中本地缓存 .remote-cache/<name> → 直接回放；
+ *   2) 未命中 → ssh cat 取回 → 原子写入缓存 → 回给浏览器。
+ * 缓存目录以点号开头，readdir 时不会被 isValidStoredName 收录进图库。
+ */
+async function handleRemoteFile(req, res, params, ctx) {
+  req.resume(); // 无请求体
+  const name = validateRemoteFileName(params.get('name') || '');
+  if (!name) return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法' });
+  const pt = parseTargetParams(params);
+  if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
+  const { host, user, dir } = pt.target;
+
+  const cacheDir = path.join(ctx.snapDir, '.remote-cache');
+  const cachePath = remoteCachePath(ctx.snapDir, host, dir, name);
+  try {
+    const stat = await fs.promises.stat(cachePath);
+    if (stat.isFile()) return sendFile(res, cachePath, name); // 缓存命中
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+
+  let r;
+  try {
+    r = await runBuffer('ssh', [...SSH_ARGS, `${user}@${host}`, `cat '${dir}/${name}'`]);
+  } catch (err) {
+    return sendJson(res, 502, { ok: false, error: err.message || '读取远端文件失败' });
+  }
+  if (r.code !== 0) {
+    return sendJson(res, 404, {
+      ok: false,
+      error: `读取远端文件失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`,
+    });
+  }
+
+  // 落缓存：临时文件 + rename，避免半成品被后续请求命中；写缓存失败不阻断本次读取
+  try {
+    await ensureDir(cacheDir);
+    const tmp = path.join(cacheDir, `.${name}.${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`);
+    await fs.promises.writeFile(tmp, r.stdout);
+    await fs.promises.rename(tmp, cachePath);
+  } catch (err) {
+    console.warn('写入远端缩略图缓存失败（不影响本次读取）：', err.message);
+  }
+  res.writeHead(200, { 'Content-Type': mimeOf(name), 'Content-Length': r.stdout.length });
+  res.end(r.stdout);
+}
+
+/**
+ * DELETE /api/remote-file?host=&user=&dir=&name=
+ * 删除远端目标上的单个文件（幂等：文件本就不存在也返回 ok）。
+ * 只删远端文件，不碰本地图库与历史记录——记录清理由前端按目标作用域处理。
+ */
+async function handleRemoteDelete(req, res, params, ctx) {
+  req.resume();
+  const name = validateRemoteFileName(params.get('name') || '');
+  if (!name) return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法' });
+  const pt = parseTargetParams(params);
+  if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
+  const { host, user, dir } = pt.target;
+
+  let r;
+  try {
+    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, `rm -f '${dir}/${name}'`]);
+  } catch (err) {
+    return sendJson(res, 502, { ok: false, error: err.message || '删除远端文件失败' });
+  }
+  if (r.code !== 0) {
+    return sendJson(res, 502, {
+      ok: false,
+      error: `删除远端文件失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`,
+    });
+  }
+  // 顺带清掉本地缓存，避免删后仍能命中旧图
+  await fs.promises.rm(remoteCachePath(ctx.snapDir, host, dir, name), { force: true }).catch(() => {});
+  return sendJson(res, 200, { ok: true });
+}
+
+/**
+ * POST /pull?host=&user=&dir=&name=
+ * 把远端文件拉回本地图库（跨服务器同步的中转步骤）：
+ *   1) 远端名自带 md5 时先看本地是否已有同内容 → 直接复用，不重复下载；
+ *   2) 否则 scp/rsync 取回到临时文件 → 算内容 md5 → 原子改名 <md5>-<原名> 落库。
+ * 返回 localName（本地存储名）与 remoteName（远端真实名），供前端写历史。
+ */
+async function handlePull(req, res, params, ctx) {
+  req.resume();
+  const name = validateRemoteFileName(params.get('name') || '');
+  if (!name) return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法' });
+  const pt = parseTargetParams(params);
+  if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
+  const { host, user, dir } = pt.target;
+
+  await ensureDir(ctx.snapDir);
+  const knownMd5 = md5OfName(name);
+  if (knownMd5) {
+    const existing = await findLocalByMd5(ctx.snapDir, knownMd5);
+    if (existing) {
+      // 本地已有同内容副本：按“复用”处理，避免重复下载与重复文件
+      return sendJson(res, 200, { ok: true, localName: existing, remoteName: name, method: 'reuse' });
+    }
+  }
+
+  // 临时文件以点号开头、.tmp 结尾，不匹配 isValidStoredName，残留也不会进入图库
+  const tmpPath = path.join(
+    ctx.snapDir,
+    `.pull-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`,
+  );
+  const result = await ctx.enqueue(async () => {
+    try {
+      await pullToLocal(tmpPath, name, { host, user, dir });
+      // 大小上限与 /api/remote-file 对齐，避免大文件整块读入内存
+      const stat = await fs.promises.stat(tmpPath);
+      if (stat.size > ctx.maxBody) {
+        throw new Error(`远端文件超过大小上限（${formatSize(ctx.maxBody)}）`);
+      }
+      const bytes = await fs.promises.readFile(tmpPath);
+      // 用远端名里的原名重新命名，保证落库名恒为 <md5>-<原名>
+      const localName = md5Name(bytes, origFromStoredName(name));
+      const localPath = path.join(ctx.snapDir, localName);
+      if (fs.existsSync(localPath)) {
+        await fs.promises.rm(tmpPath, { force: true }); // 同内容已存在：复用
+        return { localName, method: 'reuse' };
+      }
+      await fs.promises.rename(tmpPath, localPath);
+      return { localName, method: 'pull' };
+    } catch (err) {
+      await fs.promises.rm(tmpPath, { force: true }).catch(() => {}); // 失败也清掉临时文件
+      throw err;
+    }
+  });
+  return sendJson(res, 200, {
+    ok: true,
+    localName: result.localName,
+    remoteName: name,
+    method: result.method,
+  });
+}
+
 /** GET /api/library：列出本机目录中所有合法存储名文件，按 mtime 降序（新图在前） */
 async function handleLibrary(res, ctx) {
   await ensureDir(ctx.snapDir);
@@ -1786,6 +3006,16 @@ async function route(req, res, ctx) {
   }
   if (req.method === 'POST' && pathname === '/sync') {
     return handleSync(req, res, searchParams, ctx);
+  }
+  if (req.method === 'POST' && pathname === '/pull') {
+    return handlePull(req, res, searchParams, ctx);
+  }
+  if (req.method === 'GET' && pathname === '/api/remote') {
+    return handleRemoteList(res, searchParams);
+  }
+  if (pathname === '/api/remote-file') {
+    if (req.method === 'GET') return handleRemoteFile(req, res, searchParams, ctx);
+    if (req.method === 'DELETE') return handleRemoteDelete(req, res, searchParams, ctx);
   }
   if (req.method === 'GET' && pathname === '/api/library') {
     return handleLibrary(res, ctx);
