@@ -625,8 +625,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 #syncClose { font-size: 15px; line-height: 1; padding: 1px 8px; }
 .drawer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
 .sync-empty { color: #8b949e; font-size: 12px; text-align: center; padding: 14px 6px; }
-/* 抽屉内缺项 = 历史卡片样式，仅单列铺满抽屉宽 */
-.sync-card { width: 100%; }
+/* 抽屉内缺项 = 历史卡片样式，仅单列铺满抽屉宽；flex:0 0 auto 防止条目过多时被压缩（否则操作行被裁且不触发滚动） */
+.sync-card { width: 100%; flex: 0 0 auto; }
 .sync-card .card-ops { justify-content: space-between; align-items: center; margin-top: 2px; }
 .sync-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
 .sync-err { color: #cf222e; font-size: 11px; word-break: break-all; line-height: 1.4; }

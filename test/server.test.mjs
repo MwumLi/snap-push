@@ -705,6 +705,8 @@ describe('HTTP 基础接口', () => {
     assert.ok(!html.includes('历史图库'), '不应再出现“历史图库”');
     assert.ok(html.includes("makeStateBadge('remote-only', '远端独有')"), '应含远端独有卡片的“远端独有”标识');
     assert.ok(html.includes("makeStateBadge('stale', '远端已删')"), '应含“远端已删”状态标识');
+    // 回归守卫：抽屉条目过多时卡片不得被 flex 压缩（否则操作行被裁且无法滚动）
+    assert.ok(html.includes('.sync-card { width: 100%; flex: 0 0 auto; }'), '抽屉卡片应 flex:0 0 auto 防止压缩');
     // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
     assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
     assert.ok(!html.includes('badge-verified'), '不应再引用 badge-verified');
