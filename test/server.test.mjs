@@ -707,6 +707,12 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes("makeStateBadge('stale', '远端已删')"), '应含“远端已删”状态标识');
     // 回归守卫：抽屉条目过多时卡片不得被 flex 压缩（否则操作行被裁且无法滚动）
     assert.ok(html.includes('.sync-card { width: 100%; flex: 0 0 auto; }'), '抽屉卡片应 flex:0 0 auto 防止压缩');
+    // 卡片新增/删除动效：淡入 + 缩放（图库网格与同步抽屉共用）
+    assert.ok(html.includes('@keyframes card-in'), '应含卡片入场关键帧');
+    assert.ok(html.includes('@keyframes card-out'), '应含卡片出场关键帧');
+    assert.ok(html.includes('.card-enter'), '应含卡片入场类');
+    assert.ok(html.includes('.card-leave'), '应含卡片出场类');
+    assert.ok(html.includes('prefers-reduced-motion'), '应尊重系统“减少动态效果”设置');
     // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
     assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
     assert.ok(!html.includes('badge-verified'), '不应再引用 badge-verified');
@@ -1162,6 +1168,45 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     assert.ok(!hasText(grid, '妙传') && !hasText(grid, 'rsync') && !hasText(grid, 'scp'), '图库卡片不应再出现传输方式徽标');
   });
 
+  // 新增动效：首次渲染的卡片应带 card-enter（淡入 + 缩放），验证键追踪生效
+  test('新出现的图库卡片带 card-enter 入场动效', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const store = new Map();
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    const fetchShim = async (url) => {
+      const u = String(url);
+      const body = u.includes('/api/library')
+        ? { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }
+        : { ok: true };
+      return { ok: true, status: 200, json: async () => body };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    assert.ok(hasText(grid, 'local.png'), '应渲染本地卡片');
+    assert.ok(
+      findNode(grid, (n) => typeof n.className === 'string' && n.className.includes('card-enter')),
+      '首次渲染的卡片应带 card-enter 入场动效',
+    );
+  });
+
   // 回归：删除远端后，refreshHistory 不得用过期探测快照把记录“恢复”回来。
   // 修复前：dropRemoteIndexFile 未同步 probeState，删除后卡片复活，刷新后误标「远端已删」。
   test('服务器目标删除后卡片立即消失，且不残留“远端已删”', async () => {
@@ -1232,9 +1277,10 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     delBtn._trigger('click'); // 触发删除 → 弹确认
     byId['confirmOk']._trigger('click'); // 确认删除
 
-    await new Promise((r) => setTimeout(r, 80)); // 等删除请求 + refreshHistory 重绘
+    // 删除成功后先播放 180ms 出场动效，再 refreshHistory 重绘，故等待时间需覆盖动画时长
+    await new Promise((r) => setTimeout(r, 400));
     assert.ok(deleteCalled, '应发起远端删除请求');
-    assert.ok(!hasText(grid, 'local.png'), '删除后卡片应立即消失');
+    assert.ok(!hasText(grid, 'local.png'), '删除后卡片应在出场动效后消失');
     assert.ok(!hasText(grid, '远端已删'), '删除后不应残留“远端已删”记录');
   });
 

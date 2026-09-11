@@ -605,6 +605,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
+/* —— 卡片新增/删除动效：淡入 + 缩放（图库网格与同步抽屉共用） —— */
+@keyframes card-in { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+@keyframes card-out { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(.92); } }
+.card-enter { animation: card-in .22s ease-out both; }
+.card-leave { animation: card-out .18s ease-in both; pointer-events: none; }
+/* 系统开启「减少动态效果」时不做动画，直接呈现终态 */
+@media (prefers-reduced-motion: reduce) { .card-enter, .card-leave { animation: none; } }
+
 /* —— 图库区：左侧网格占满；「同步」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
 .hist-area { position: relative; }
 #syncDrawer {
@@ -1621,6 +1629,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (changed) saveJson(HISTORY_KEY, history);
   }
 
+  // 卡片新增动效的键追踪：每个容器记录上一轮已渲染的卡片键，
+  // 只有本轮「新出现」的键才加入场动效，避免每次刷新（探测/同步/切换目标）全部卡片一起动。
+  // scope 为容器标识（'grid' / 'sync'），keys 为本轮全部卡片键；返回 isNew(key)。
+  var renderedKeys = { grid: {}, sync: {} };
+  function markNewCards(scope, keys) {
+    var prev = renderedKeys[scope] || {};
+    var next = {};
+    keys.forEach(function (k) { next[k] = true; });
+    renderedKeys[scope] = next;
+    return function (key) { return !prev[key]; };
+  }
+
   // 图库 = 当前目标下的全部图片：
   //   本机   → 全部本地图；
   //   服务器 → 该目标上存在的本地图（history ∪ remoteIndex）+ 远端独有（本地无副本）。
@@ -1658,6 +1678,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       ? total + ' 张 · ' + (srv.label || srv.host)
       : total + ' 张';
 
+    // 记录本轮卡片键：仅新出现的卡片加入场动效；空列表同样重置键集
+    var gridKeys = [];
+    locals.forEach(function (f) { gridKeys.push('L:' + f.name); });
+    remotes.forEach(function (f) { gridKeys.push('R:' + f.name); });
+    var gridIsNew = markNewCards('grid', gridKeys);
+
     grid.textContent = ''; // 清空重建（textContent 赋值不产生 XSS 面）
     if (!total) {
       var empty = document.createElement('p');
@@ -1668,8 +1694,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       grid.appendChild(empty);
       return;
     }
-    locals.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
-    remotes.forEach(function (f) { grid.appendChild(makeRemoteCard(f, srv)); });
+    locals.forEach(function (f) { grid.appendChild(makeCard(f, srv, gridIsNew('L:' + f.name))); });
+    remotes.forEach(function (f) { grid.appendChild(makeRemoteCard(f, srv, gridIsNew('R:' + f.name))); });
   }
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
@@ -1678,11 +1704,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (syncDrawer.classList.contains('open')) renderSyncList();
   }
 
-  function makeCard(f, srv) {
+  function makeCard(f, srv, isNew) {
     var rec = history[f.name];
 
     var card = document.createElement('div');
-    card.className = 'card';
+    card.className = isNew ? 'card card-enter' : 'card';
 
     // 缩略图：点击新窗口打开原图
     var link = document.createElement('a');
@@ -1734,7 +1760,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.className = 'danger';
     del.textContent = '删除';
     del.disabled = !!(srv && probeBusy[targetKey(srv)]); // 探测在途时置灰，避免用旧快照删除
-    del.addEventListener('click', function () { removeFile(f.name, srv); });
+    del.addEventListener('click', function () { removeFile(f.name, srv, card); });
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -1743,11 +1769,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 远端独有卡片（本地无副本）：缩略图按需从目标读取；操作只有复制远端路径与删除远端文件
-  function makeRemoteCard(item, srv) {
+  function makeRemoteCard(item, srv, isNew) {
     var remotePath = srv.dir + '/' + item.name;
 
     var card = document.createElement('div');
-    card.className = 'card';
+    card.className = isNew ? 'card card-enter' : 'card';
 
     var link = document.createElement('a');
     link.className = 'thumb';
@@ -1805,7 +1831,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.className = 'danger';
     del.textContent = '删除';
     del.disabled = !!probeBusy[targetKey(srv)]; // 探测在途时置灰，避免用旧快照删除
-    del.addEventListener('click', function () { removeRemoteOnly(item, srv); });
+    del.addEventListener('click', function () { removeRemoteOnly(item, srv, card); });
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -2015,14 +2041,26 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return copies;
   }
 
-  // 删除入口：按当前目标作用域分派
-  async function removeFile(name, srv) {
-    if (srv) return removeFromServer(name, srv);
-    return removeFromLocal(name);
+  // 删除出场动效：给卡片追加 .card-leave，等动画播完再由 refreshHistory 重建移除。
+  // 仅在网络删除成功后调用，确保不会出现「卡片已消失但实际没删掉」。
+  // el 为空（异常/垫片）时直接 resolve，不阻塞删除流程。
+  var LEAVE_MS = 180; // 与 CSS .card-leave 动画时长保持一致
+  function animateOut(el) {
+    return new Promise(function (resolve) {
+      if (!el || typeof el.className !== 'string') { resolve(); return; }
+      el.className = el.className + ' card-leave';
+      setTimeout(resolve, LEAVE_MS);
+    });
+  }
+
+  // 删除入口：按当前目标作用域分派（cardEl 为该卡片 DOM，用于出场动效）
+  async function removeFile(name, srv, cardEl) {
+    if (srv) return removeFromServer(name, srv, cardEl);
+    return removeFromLocal(name, cardEl);
   }
 
   // 服务器作用域删除：只删该目标的远端文件与记录，本地文件与其他目标记录保留
-  async function removeFromServer(name, srv) {
+  async function removeFromServer(name, srv, cardEl) {
     // 探测在途时禁止删除：在途探测返回的是删除前的旧快照，会把记录补录回来
     if (probeBusy[targetKey(srv)]) { hint('正在探测该目标，请稍后再删除', true); return; }
     var t = findTargetRec(name, srv);
@@ -2041,12 +2079,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     dropTargetRecord(name, srv);
     dropRemoteIndexFile(srv, remoteName);
+    await animateOut(cardEl); // 删除成功后再播放出场动效
     hint('已从 ' + (srv.label || srv.host) + ' 删除');
     refreshHistory();
   }
 
   // 本机作用域删除：删本地文件；可选级联删除所有服务器副本（远端先行、全成才删本地）
-  async function removeFromLocal(name) {
+  async function removeFromLocal(name, cardEl) {
     var copies = serverCopies(name);
     var opts = { title: '删除本地文件', message: '确定删除本地文件「' + origOf(name) + '」吗？' };
     if (copies.length) opts.checkboxLabel = '同时删除所有服务器上的副本（' + copies.length + ' 台）';
@@ -2080,6 +2119,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     delete history[name];
     saveJson(HISTORY_KEY, history);
+    await animateOut(cardEl); // 删除成功后再播放出场动效
     hint('已删除');
     refreshHistory();
   }
@@ -2280,7 +2320,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 删除「远端独有（本地无副本）」条目：只删远端文件与 remoteIndex 条目
-  async function removeRemoteOnly(item, srcSrv) {
+  async function removeRemoteOnly(item, srcSrv, cardEl) {
     // 探测在途时禁止删除：在途探测返回的是删除前的旧快照，会把记录补录回来
     if (probeBusy[targetKey(srcSrv)]) { hint('正在探测该来源，请稍后再删除', true); return; }
     var r = await showConfirm({
@@ -2295,14 +2335,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     dropRemoteIndexFile(srcSrv, item.name);
+    await animateOut(cardEl); // 删除成功后再播放出场动效
     hint('已删除');
     refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
   }
 
   // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步 / 删除远端独有）
-  function buildSyncCard(item, srcSrv, target) {
+  function buildSyncCard(item, srcSrv, target, isNew) {
     var card = document.createElement('div');
-    card.className = 'card sync-card';
+    card.className = isNew ? 'card sync-card card-enter' : 'card sync-card';
 
     var localName = item.md5 ? localNameByMd5(item.md5) : null;
     var href = itemThumbUrl(item, srcSrv);
@@ -2380,7 +2421,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       delBtn.className = 'danger';
       delBtn.textContent = '删除';
       delBtn.disabled = !!probeBusy[targetKey(srcSrv)]; // 探测在途时置灰，避免用旧快照删除
-      delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv); });
+      delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv, card); });
       ops.appendChild(delBtn);
     }
     body.appendChild(ops);
@@ -2402,6 +2443,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var missing = missingItems();
     if (missing === null) {
+      markNewCards('sync', []); // 清单不可用：重置键集，下次出现时重新播入场动效
       // 来源服务器还没探测：给一个手动探测入口
       var tip = document.createElement('p');
       tip.className = 'sync-empty';
@@ -2419,6 +2461,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     if (!missing.length) {
+      markNewCards('sync', []); // 空列表：重置键集，下次出现时重新播入场动效
       var empty = document.createElement('p');
       empty.className = 'sync-empty';
       empty.textContent = srcLabel + ' 中所有图片都已同步到 ' + tgtLabel;
@@ -2428,7 +2471,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       updateSyncSelBtn();
       return;
     }
-    missing.forEach(function (item) { syncList.appendChild(buildSyncCard(item, srcSrv, target)); });
+    // 记录本轮抽屉卡片键（含来源）：仅新出现的条目播入场动效
+    var syncKeys = missing.map(function (item) { return syncSourceSel.value + '|' + item.name; });
+    var syncIsNew = markNewCards('sync', syncKeys);
+    missing.forEach(function (item) {
+      syncList.appendChild(buildSyncCard(item, srcSrv, target, syncIsNew(syncSourceSel.value + '|' + item.name)));
+    });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     syncSelAll.textContent = allChecked ? '取消全选' : '全选';
