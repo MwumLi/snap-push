@@ -25,8 +25,15 @@ import {
   getOrCreateSecret,
   mimeOf,
   buildProbeScript,
+  md5OfName,
+  origFromStoredName,
+  validateRemoteFileName,
+  buildRemoteListScript,
+  parseRemoteList,
   run,
+  runBuffer,
   syncToRemote,
+  pullToLocal,
 } from '../src/server.js';
 
 const HEX32 = 'd41d8cd98f00b204e9800998ecf8427e'; // 合法的 32 位小写 hex 样例（md5("")）
@@ -151,8 +158,8 @@ describe('纯函数：validateDir', () => {
     assert.equal(validateDir('/data/images_v2.bak'), '/data/images_v2.bak');
   });
 
-  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠）', () => {
-    const badValues = ['tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/'];
+  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠 / .. 穿越）', () => {
+    const badValues = ['tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/', '/tmp/../etc', '/../etc', '/a/../../b'];
     for (const bad of badValues) {
       assert.equal(validateDir(bad), null, `validateDir 应拒绝: ${JSON.stringify(bad)}`);
     }
@@ -183,6 +190,91 @@ describe('纯函数：isValidStoredName', () => {
     for (const bad of badValues) {
       assert.equal(isValidStoredName(bad), false, `应拒绝: ${JSON.stringify(bad)}`);
     }
+  });
+});
+
+describe('纯函数：md5OfName / origFromStoredName', () => {
+  test('合法存储名取出 md5 与原名', () => {
+    assert.equal(md5OfName(`${HEX32}-a.png`), HEX32);
+    assert.equal(origFromStoredName(`${HEX32}-a.png`), 'a.png');
+    // 原名本身可含连字符，仍完整还原
+    assert.equal(origFromStoredName(`${HEX32}-my-shot.png`), 'my-shot.png');
+  });
+
+  test('不符合约定时：md5 为 null，原名整体返回', () => {
+    assert.equal(md5OfName('x.png'), null);
+    assert.equal(md5OfName(undefined), null);
+    assert.equal(origFromStoredName('x.png'), 'x.png');
+    assert.equal(origFromStoredName(''), 'image.png');
+  });
+});
+
+describe('纯函数：validateRemoteFileName', () => {
+  test('接受安全文件名（含无 md5 前缀的手工名）', () => {
+    assert.equal(validateRemoteFileName(`${HEX32}-a.png`), `${HEX32}-a.png`);
+    assert.equal(validateRemoteFileName('manual-shot.png'), 'manual-shot.png');
+    assert.equal(validateRemoteFileName('a_b.c-d'), 'a_b.c-d');
+  });
+
+  test('拒绝路径穿越 / 引号 / 空白 / 纯点 / 非字符串', () => {
+    const bad = ['../etc/passwd', 'a/b.png', "a'b.png", 'a b.png', '.', '..', '', undefined, null];
+    for (const v of bad) {
+      assert.equal(validateRemoteFileName(v), null, `应拒绝: ${JSON.stringify(v)}`);
+    }
+  });
+});
+
+describe('纯函数：buildRemoteListScript', () => {
+  test('脚本包含目录判断、rsync 探测与 ls -1（快照断言）', () => {
+    const script = buildRemoteListScript('/tmp/snap-push');
+    assert.equal(script, [
+      "if [ -d '/tmp/snap-push' ]; then",
+      '  echo ::DIR_OK::;',
+      '  command -v rsync >/dev/null 2>&1 && echo ::RSYNC_OK:: || echo ::RSYNC_NO::;',
+      "  ls -1 '/tmp/snap-push' 2>/dev/null;",
+      'else',
+      '  echo ::DIR_MISSING::;',
+      'fi',
+    ].join('\n'));
+  });
+});
+
+describe('纯函数：parseRemoteList', () => {
+  test('目录存在 + 有 rsync + 正常文件名', () => {
+    const out = ['::DIR_OK::', '::RSYNC_OK::', `${HEX32}-a.png`, 'manual.png'].join('\n');
+    assert.deepEqual(parseRemoteList(out), {
+      dirExists: true,
+      hasRsync: true,
+      files: [
+        { name: `${HEX32}-a.png`, md5: HEX32 },
+        { name: 'manual.png', md5: null },
+      ],
+    });
+  });
+
+  test('无 rsync 标记 → hasRsync=false', () => {
+    const out = ['::DIR_OK::', '::RSYNC_NO::', `${HEX32}-a.png`].join('\n');
+    const parsed = parseRemoteList(out);
+    assert.equal(parsed.dirExists, true);
+    assert.equal(parsed.hasRsync, false);
+    assert.equal(parsed.files.length, 1);
+  });
+
+  test('目录缺失 → 空清单', () => {
+    assert.deepEqual(parseRemoteList('::DIR_MISSING::'), { dirExists: false, hasRsync: false, files: [] });
+  });
+
+  test('非法名（含空格/引号）被忽略，标记行不入清单', () => {
+    const out = ['::DIR_OK::', '::RSYNC_OK::', 'a b.png', "a'b.png", 'ok.png'].join('\n');
+    const parsed = parseRemoteList(out);
+    assert.deepEqual(parsed.files, [{ name: 'ok.png', md5: null }]);
+  });
+
+  test('文件名与旧标记同名不再冲突（标记已改为 :: 前缀）', () => {
+    const out = ['::DIR_OK::', '__DIR_MISSING__', '::RSYNC_OK::', 'plain.png'].join('\n');
+    const parsed = parseRemoteList(out);
+    assert.equal(parsed.dirExists, true);
+    assert.deepEqual(parsed.files.map((f) => f.name), ['__DIR_MISSING__', 'plain.png']);
   });
 });
 
@@ -299,6 +391,27 @@ describe('run 子进程封装', () => {
   });
 });
 
+describe('runBuffer 二进制子进程封装', () => {
+  test('stdout 以 Buffer 收集，二进制字节不被 utf8 破坏', async () => {
+    // 输出 0x00-0xff 全字节序列，验证不做 utf8 解码
+    const r = await runBuffer('node', [
+      '-e',
+      'process.stdout.write(Buffer.from(Array.from({length:256},(_,i)=>i)))',
+    ]);
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout.length, 256);
+    assert.equal(r.stdout[0], 0);
+    assert.equal(r.stdout[255], 255);
+  });
+
+  test('超过大小上限时抛中文错误并强杀', async () => {
+    await assert.rejects(
+      runBuffer('node', ['-e', 'process.stdout.write(Buffer.alloc(4096))'], 5000, 1024),
+      (err) => err instanceof Error && /大小上限/.test(err.message),
+    );
+  });
+});
+
 // =====================================================================
 // 三、syncToRemote 失败分支（不依赖真实网络）
 // =====================================================================
@@ -398,6 +511,150 @@ describe('POST /sync（从图库补齐接口）', () => {
 });
 
 // =====================================================================
+// 三·六、HTTP 集成：远端对账与拉取接口
+// =====================================================================
+
+describe('GET /api/remote（探测 + 清单）', () => {
+  let server;
+  let base;
+
+  before(async () => {
+    ({ server, base } = await startServer({ snapDir: path.join(tmpRoot, 'remote-list') }));
+  });
+
+  after(async () => {
+    await stopServer(server);
+  });
+
+  test('缺 host / dir 非法 → 400', async () => {
+    let r = await fetch(`${base}/api/remote?dir=/tmp/x`);
+    assert.equal(r.status, 400);
+    r = await fetch(`${base}/api/remote?host=127.0.0.1&dir=relative`);
+    assert.equal(r.status, 400);
+  });
+
+  test('目标不可达 → 200 且 ok:false（前端据此忽略本次合并）', async () => {
+    const r = await fetch(`${base}/api/remote?host=127.0.0.256&user=root&dir=/tmp/x`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ssh|失败/);
+  });
+});
+
+describe('GET / DELETE /api/remote-file（远端缩略图）', () => {
+  let server;
+  let base;
+  let snapDir;
+
+  before(async () => {
+    snapDir = path.join(tmpRoot, 'remote-file');
+    ({ server, base } = await startServer({ snapDir }));
+  });
+
+  after(async () => {
+    await stopServer(server);
+  });
+
+  test('GET 命中本地缓存 → 直接回放字节（不回退 ssh）', async () => {
+    const host = '127.0.0.1';
+    const dir = '/tmp/x';
+    const name = `${HEX32}-cached.png`;
+    // 复现服务端的缓存键：sha1(host|dir) 前 12 位 + '-' + 文件名
+    const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
+    const cacheDir = path.join(snapDir, '.remote-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, `${key}-${name}`), Buffer.from([1, 2, 3, 4]));
+
+    const url = `${base}/api/remote-file?host=${host}&user=root&dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`;
+    const r = await fetch(url);
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('content-type'), 'image/png');
+    const buf = Buffer.from(await r.arrayBuffer());
+    assert.deepEqual([...buf], [1, 2, 3, 4]);
+  });
+
+  test('GET 缺 name / name 含路径穿越 → 400', async () => {
+    let r = await fetch(`${base}/api/remote-file?host=127.0.0.1&dir=/tmp/x`);
+    assert.equal(r.status, 400);
+    r = await fetch(
+      `${base}/api/remote-file?host=127.0.0.1&dir=/tmp/x&name=${encodeURIComponent('../etc/passwd')}`,
+    );
+    assert.equal(r.status, 400);
+  });
+
+  test('GET 目标不可达 → 404 且 ok:false，服务不崩', async () => {
+    const r = await fetch(
+      `${base}/api/remote-file?host=127.0.0.256&user=root&dir=/tmp/x&name=${HEX32}-a.png`,
+    );
+    assert.equal(r.status, 404);
+    const body = await r.json();
+    assert.equal(body.ok, false);
+    const health = await fetch(`${base}/health`);
+    assert.equal(health.status, 200);
+  });
+
+  test('DELETE 缺 name → 400；目标不可达 → 502', async () => {
+    let r = await fetch(`${base}/api/remote-file?host=127.0.0.1&dir=/tmp/x`, { method: 'DELETE' });
+    assert.equal(r.status, 400);
+    r = await fetch(
+      `${base}/api/remote-file?host=127.0.0.256&user=root&dir=/tmp/x&name=${HEX32}-a.png`,
+      { method: 'DELETE' },
+    );
+    assert.equal(r.status, 502);
+    assert.equal((await r.json()).ok, false);
+  });
+});
+
+describe('POST /pull（拉回本地）', () => {
+  let server;
+  let base;
+  let snapDir;
+
+  before(async () => {
+    snapDir = path.join(tmpRoot, 'pull');
+    ({ server, base } = await startServer({ snapDir }));
+  });
+
+  after(async () => {
+    await stopServer(server);
+  });
+
+  test('缺 name / 缺 host → 400', async () => {
+    let r = await fetch(`${base}/pull?host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+    r = await fetch(`${base}/pull?name=${HEX32}-a.png&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 400);
+  });
+
+  test('本地已有同 md5 → 直接复用，不发起网络请求', async () => {
+    // 先本机落盘一张图，拿到其 <md5>-原名
+    const bytes = crypto.randomBytes(24);
+    const up = await upload(base, { name: 'dup.png' }, bytes);
+    const localName = (await up.json()).localName;
+    // 用同一名字向一个不可达 host 发起 pull：若走网络会失败，能成功即证明命中复用分支
+    const r = await fetch(
+      `${base}/pull?name=${encodeURIComponent(localName)}&host=127.0.0.256&user=root&dir=/tmp/x`,
+      { method: 'POST' },
+    );
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.method, 'reuse');
+    assert.equal(body.localName, localName);
+  });
+
+  test('本地无副本且目标不可达 → 500 中文错误', async () => {
+    const r = await fetch(
+      `${base}/pull?name=${HEX32}-ghost.png&host=127.0.0.256&user=root&dir=/tmp/x`,
+      { method: 'POST' },
+    );
+    assert.equal(r.status, 500);
+    assert.equal((await r.json()).ok, false);
+  });
+});
+
+// =====================================================================
 // 四、HTTP 集成：基础接口（共享一个测试实例）
 // =====================================================================
 
@@ -435,6 +692,13 @@ describe('HTTP 基础接口', () => {
     assert.ok(res.headers.get('content-type').startsWith('text/html'));
     const html = await res.text();
     assert.ok(html.includes('snap-push'));
+    // 新增的对账/同步 UI 关键节点与接口引用（防止页面模板回退）
+    assert.ok(html.includes('id="targetStatus"'), '应含目标状态徽标');
+    assert.ok(html.includes('id="recheckBtn"'), '应含重新对账按钮');
+    assert.ok(html.includes('id="confirmMask"'), '应含确认弹窗');
+    assert.ok(html.includes('id="syncSource"'), '应含同步来源选择');
+    assert.ok(html.includes('/api/remote?'), '应引用远端探测接口');
+    assert.ok(html.includes('/pull?'), '应引用拉回接口');
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {
@@ -679,8 +943,94 @@ describe('HTTP 体积上限（maxBody=1024 注入）', () => {
 // 七、E2E：真实 ssh/rsync/scp（默认跳过；SNAP_PUSH_E2E=1 且本机 sshd 免密时启用）
 // =====================================================================
 
-const e2eEnabled = process.env.SNAP_PUSH_E2E === '1';
+// =====================================================================
+// 五、内嵌页面脚本冒烟（DOM 垫片）
+// 用最小 DOM 垫片执行页面脚本，捕获初始化期的 ReferenceError / TypeError。
+// 不追求行为正确，只作为“页面脚本可被浏览器解析并初始化”的回归守卫。
+// =====================================================================
 
+describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
+  let server;
+  let base;
+
+  before(async () => {
+    ({ server, base } = await startServer({ snapDir: path.join(tmpRoot, 'page-smoke') }));
+  });
+
+  after(async () => {
+    await stopServer(server);
+  });
+
+  function makeEl() {
+    return {
+      _children: [],
+      style: {},
+      classList: { add() {}, remove() {}, contains() { return false; } },
+      appendChild(c) { this._children.push(c); return c; },
+      addEventListener() {},
+      removeEventListener() {},
+      getAttribute() { return ''; },
+      setAttribute() {},
+      removeAttribute() {},
+      focus() {},
+      click() {},
+      reset() {},
+      textContent: '',
+      value: '',
+      hidden: false,
+      disabled: false,
+      className: '',
+      title: '',
+      type: '',
+      checked: false,
+      alt: '',
+      src: '',
+      href: '',
+      target: '',
+      rel: '',
+      loading: '',
+      placeholder: '',
+      files: null,
+    };
+  }
+
+  test('从 GET / 提取脚本并在垫片中初始化不抛异常', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const byId = {};
+    const documentShim = {
+      body: makeEl(),
+      getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
+      createElement() { return makeEl(); },
+      createTextNode(t) { return { text: t }; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const store = new Map();
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    const fetchShim = () => new Promise(() => {}); // 挂起，避免触发真实网络
+
+    assert.doesNotThrow(() => {
+      // eslint-disable-next-line no-new-func
+      new Function(
+        'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+        'setTimeout', 'clearTimeout',
+        m[1],
+      )(
+        documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams,
+        setTimeout, clearTimeout,
+      );
+    }, '页面脚本初始化不应抛异常');
+  });
+});
+
+const e2eEnabled = process.env.SNAP_PUSH_E2E === '1';
 describe('E2E：真实 ssh 同步（需 SNAP_PUSH_E2E=1 与本机 sshd 免密）', { skip: !e2eEnabled }, () => {
   const SSH_ARGS = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new'];
   let localPath;

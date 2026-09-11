@@ -52,7 +52,25 @@ node snap-push/server.mjs
 1. **Default target is the local machine**: no remote upload — images land in the local `SNAP_PUSH_DIR`, and the page shows the absolute path.
 2. **Push to a server**: click **⚙ Manage** to add a config — nickname (optional), IP, username (default `root`), remote dir (default `/tmp/snap-push`), static URL prefix (optional). Then switch targets from the top dropdown.
 3. **Upload** any of three ways: click to pick images, drag & drop into the upload area, or screenshot and paste with `Ctrl+V`. On success the page shows the remote path (plus URL if a prefix is configured) — copy in one click.
-4. **History library** is strictly filtered by the current target: picking a server shows only images pushed to it; the local view shows everything.
+4. **History library** is strictly filtered by the current target: picking a server shows only images pushed to it; the local view shows everything. Card titles follow the current target — i.e. the file name as it exists on that machine.
+5. **Remote reconciliation**: switching to a server target probes it asynchronously. A status badge appears next to the dropdown (online / offline / dir missing / scp fallback) along with a summary (remote-only N / missing M). A failed probe only affects the status display and never touches history. Use **Recheck** to force a refresh. Records whose remote file was deleted are marked; clean them in bulk with **Clean missing records**, or re-push from the library.
+6. **Sync (multi-source)**: click **Sync** to open the drawer. The target is the currently selected target (local or server); the source can be **Local library** or another server. It lists items present at the source but absent at the target (deduped by content md5); remote-only items show a thumbnail fetched on demand over ssh (lazy-loaded and cached locally). With the local target it pulls back to local; with a server target it first ensures the bytes exist locally (pulling from the source when needed) and then pushes to the target — i.e. A → local → B.
+7. **Delete (target-scoped)**: under a server target, deleting removes only that server's file and that target's record — the local file and other targets' records stay. Under the local target, deleting removes the local file by default (remote copies remain and later show up as "remote-only"); the dialog offers **Also delete copies on all servers** (remotes are deleted first; the local file is deleted only if every remote succeeds, otherwise the whole operation aborts). Every delete is confirmed.
+
+## HTTP API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/upload` | Upload image bytes; with `host/user/dir` it syncs to the remote, otherwise stores locally only |
+| `POST` | `/sync` | Push an existing local-library file to the remote (no byte re-upload) |
+| `POST` | `/pull` | Pull a remote file back into the local library (reuses an existing same-md5 file) |
+| `GET` | `/api/remote` | Probe a target: reachability, dir existence, rsync availability, and file listing (for reconciliation) |
+| `GET` | `/api/remote-file` | Fetch a remote file's bytes on demand (thumbnail / preview); replays the local cache when present |
+| `DELETE` | `/api/remote-file` | Delete a single file on the remote target (idempotent) |
+| `GET` | `/api/library` | Local library listing |
+| `GET` | `/files/<name>` | Read a local-library file's bytes |
+| `DELETE` | `/files/<name>` | Delete a local-library file |
+| `GET` | `/health` | Health check and instance identity |
 
 ## Architecture & Scenarios
 
@@ -83,15 +101,18 @@ One picture tells the whole story: an image goes from the browser to the local s
 
 ## Transfer Mechanism
 
-- **rsync first, scp fallback**: if the remote has rsync it transfers with `rsync -az`; otherwise it automatically degrades to `scp`.
-- **Naming `<md5>-<original>`**: identical content → identical name → natural dedup.
+- **rsync first, scp fallback**: if the remote has rsync it transfers with `rsync -az`; otherwise it automatically degrades to `scp`. The pull (`/pull`) direction works the same way.
+- **Naming `<md5>-<original>`**: identical content → identical name → natural dedup; reconciliation and cross-server sync both use the md5 as the content identity.
 - **Instant re-upload**: before uploading, a single ssh call compares the remote file's md5. If the content already exists it skips the transfer (`method: skip`, instant). If the same-named remote file has mismatched content (e.g. a leftover partial file), it is treated as missing and re-uploaded to repair it (self-healing).
+- **On-demand reads**: remote thumbnails / previews are fetched over ssh via `/api/remote-file` (20MB per file) and cached under the local `.remote-cache/` (a dot-directory excluded from the library), so repeated views don't re-run ssh.
 
 ## FAQ
 
 - **"ssh probe failed"**: passwordless login to the target isn't set up, or the host is unreachable. First verify with `ssh user@host` manually.
 - **Remote has no rsync**: nothing to do — it falls back to scp automatically, and the result is labeled `scp`.
 - **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails. Instant-skip logic only looks at the remote — it is independent of local storage.
+- **What does "remote-only" mean?** A file that exists on the target server but has no copy in the local library (perhaps pushed by another client). It only appears in the **Sync** drawer, with its thumbnail read from the remote on demand; pull it back locally to display and redistribute it normally.
+- **Does deleting remove remote files too?** Under a server target, deletion affects only that target. Under the local target, only the local file is removed by default; tick **Also delete copies on all servers** in the dialog to cascade (the local file is deleted only after every remote deletion succeeds).
 - **Where are my configs / history stored?** In the browser's localStorage, namespaced per snap-push instance (header badge `hostname  #hash`). The instance identity is a random secret persisted at `~/.config/snap-push/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID` (or delete it and start clean in the browser).
 
 ## Development
