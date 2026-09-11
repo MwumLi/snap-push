@@ -1799,7 +1799,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     list.appendChild(row);
     body.appendChild(list);
 
-    body.appendChild(makeStateBadge('remote-only', '仅远端'));
+    body.appendChild(makeStateBadge('remote-only', '远端'));
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';

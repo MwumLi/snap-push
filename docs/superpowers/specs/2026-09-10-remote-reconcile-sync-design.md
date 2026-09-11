@@ -108,7 +108,7 @@ servers[i].status = {
 
 ## 6. 命名规则
 
-- **网格（图库）**：展示当前目标下的全部图片——本地存在的 + 远端独有的（`remoteIndex` 中本地无同 md5 的项，带「仅远端」标识，缩略图走 `/api/remote-file`）。
+- **网格（图库）**：展示当前目标下的全部图片——本地存在的 + 远端独有的（`remoteIndex` 中本地无同 md5 的项，带「远端」标识，缩略图走 `/api/remote-file`）。
   - 本机 → 本地原名；
   - 服务器 A → A 上该文件的原名（`remoteName` → `remotePath` 的 basename → 本地原名）。
 - **抽屉（同步）**：随来源。

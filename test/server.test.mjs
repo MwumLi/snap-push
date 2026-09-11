@@ -703,7 +703,7 @@ describe('HTTP 基础接口', () => {
     assert.ok(!html.includes("makeStateBadge('recovered'"), '不应再挂 recovered 状态徽标');
     // 图库改名与远端独有展示
     assert.ok(!html.includes('历史图库'), '不应再出现“历史图库”');
-    assert.ok(html.includes('仅远端'), '应含远端独有卡片的“仅远端”标识');
+    assert.ok(html.includes("makeStateBadge('remote-only', '远端')"), '应含远端独有卡片的“远端”标识');
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {
@@ -1042,7 +1042,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     return false;
   }
 
-  test('图库按目标渲染“本地 + 远端独有”，远端独有卡片带“仅远端”标识', async () => {
+  test('图库按目标渲染“本地 + 远端独有”，远端独有卡片带“远端”标识', async () => {
     const html = await (await fetch(`${base}/`)).text();
     const m = /<script>([\s\S]*?)<\/script>/.exec(html);
     assert.ok(m, '应能提取内嵌 <script>');
@@ -1100,7 +1100,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const grid = byId['grid'];
     assert.ok(hasText(grid, 'local.png'), '应渲染本地卡片');
     assert.ok(hasText(grid, 'remote.png'), '应渲染远端独有卡片');
-    assert.ok(hasText(grid, '仅远端'), '远端独有卡片应带“仅远端”标识');
+    assert.ok(hasText(grid, '远端'), '远端独有卡片应带“远端”标识');
   });
 });
 
