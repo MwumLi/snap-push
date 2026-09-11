@@ -701,6 +701,9 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes('/pull?'), '应引用拉回接口');
     // 回归守卫：#3 恢复记录属于正常一致态，不应再挂 recovered 状态徽标
     assert.ok(!html.includes("makeStateBadge('recovered'"), '不应再挂 recovered 状态徽标');
+    // 图库改名与远端独有展示
+    assert.ok(!html.includes('历史图库'), '不应再出现“历史图库”');
+    assert.ok(html.includes('仅远端'), '应含远端独有卡片的“仅远端”标识');
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {
@@ -1029,6 +1032,75 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         setTimeout, clearTimeout,
       );
     }, '页面脚本初始化不应抛异常');
+  });
+
+  // 递归查找 mock 节点树里是否存在指定文本（用于断言卡片内容）
+  function hasText(node, text) {
+    if (!node) return false;
+    if (node.textContent === text) return true;
+    for (const c of node._children || []) if (hasText(c, text)) return true;
+    return false;
+  }
+
+  test('图库按目标渲染“本地 + 远端独有”，远端独有卡片带“仅远端”标识', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const REMOTE_ONLY = 'ffffffffffffffffffffffffffffffff-remote.png';
+    const REMOTE_ONLY_MD5 = 'ffffffffffffffffffffffffffffffff';
+
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      '127.0.0.1|/tmp/x': {
+        fetchedAt: Date.now(),
+        files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE_ONLY, md5: REMOTE_ONLY_MD5 }],
+      },
+    }));
+
+    const byId = {};
+    const documentShim = {
+      body: makeEl(),
+      getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
+      createElement() { return makeEl(); },
+      createTextNode(t) { return { text: t }; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    const fetchShim = async (url) => {
+      const u = String(url);
+      let body;
+      if (u.includes('/api/library')) {
+        body = { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] };
+      } else if (u.includes('/api/remote')) {
+        body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE_ONLY, md5: REMOTE_ONLY_MD5 }] };
+      } else {
+        body = { ok: true };
+      }
+      return { ok: true, status: 200, json: async () => body };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 60)); // 等 refreshHistory + 探测完成
+    const grid = byId['grid'];
+    assert.ok(hasText(grid, 'local.png'), '应渲染本地卡片');
+    assert.ok(hasText(grid, 'remote.png'), '应渲染远端独有卡片');
+    assert.ok(hasText(grid, '仅远端'), '远端独有卡片应带“仅远端”标识');
   });
 });
 

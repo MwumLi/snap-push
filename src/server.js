@@ -523,7 +523,8 @@ function sendJson(res, status, obj) {
  * 页面结构：
  *   - 顶部：目标下拉（本机 + localStorage 服务器配置）与「⚙ 管理」配置面板（增/改/删）；
  *   - 上传区：文件选择 / 拖拽 / Ctrl+V 粘贴截图，逐文件 POST /upload 并展示结果；
- *   - 历史区：/api/library 与 localStorage 历史（snap-push.history）求交渲染，
+ *   - 图库：按当前目标渲染全部图片（本地存在 + 远端独有），
+ *     /api/library 与 localStorage 历史（snap-push.history）求交，远端独有取自 remoteIndex，
  *     按当前目标（host+dir）过滤，支持复制路径/URL、删除（联动清历史记录）、对账清理。
  *
  * 安全约定：动态内容一律 createElement + textContent，绝不拼接 innerHTML；
@@ -604,7 +605,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 历史区：左侧网格占满；「从图库补齐」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
+/* —— 图库区：左侧网格占满；「同步」抽屉为悬浮层（脱离布局，不影响网格宽度/列数） —— */
 .hist-area { position: relative; }
 #syncDrawer {
   position: fixed; top: 64px; right: 16px; z-index: 50;
@@ -642,6 +643,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .badge-recovered { background: #8250df; }
 .badge-stale { background: #cf222e; }
 .badge-verified { background: #1a7f37; }
+.badge-remote-only { background: #0969da; }
 /* —— 抽屉来源选择 —— */
 .drawer-src { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #f0f2f4; font-size: 12px; }
 .drawer-src select { flex: 1; }
@@ -698,9 +700,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <p class="msg" id="msg"></p>
   </section>
 
-  <!-- 历史区：按当前目标过滤；右侧抽屉（同步）为悬浮层，不遮挡左侧 -->
+  <!-- 图库：当前目标下的全部图片（本地 + 远端独有）；右侧抽屉（同步）为悬浮层，不遮挡左侧 -->
   <section>
-    <h2>历史图库 <span class="count" id="historyCount"></span>
+    <h2>图库 <span class="count" id="historyCount"></span>
       <button type="button" id="cleanStaleBtn" hidden>清理失效记录</button>
     </h2>
     <div class="hist-area">
@@ -1507,7 +1509,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       var name = nameFor ? nameFor(files[j], j) : null;
       await uploadOne(files[j], srv, name);
     }
-    refreshHistory(); // 全部完成后刷新历史区
+    refreshHistory(); // 全部完成后刷新图库
   }
 
   fileInput.addEventListener('change', function () {
@@ -1556,9 +1558,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     });
   });
 
-  // =============== 历史图库 ===============
+  // =============== 图库 ===============
 
-  // 历史区错误占位：拉取失败时显示中文提示，绝不动 localStorage 记录
+  // 图库区错误占位：拉取失败时显示中文提示，绝不动 localStorage 记录
   function showHistoryError(message) {
     historyCount.textContent = '';
     grid.textContent = '';
@@ -1619,25 +1621,45 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (changed) saveJson(HISTORY_KEY, history);
   }
 
-  // 过滤规则：选中服务器 → 只显示 targets 含该 host+dir 的文件；本机 → 全部
+  // 图库 = 当前目标下的全部图片：
+  //   本机   → 全部本地图；
+  //   服务器 → 该目标上存在的本地图（history ∪ remoteIndex）+ 远端独有（本地无副本）。
+  // 本地卡片在前（沿用图库的时间倒序），远端独有在后（按文件名）。
   function renderGrid() {
     var srv = currentServer();
     renderStatus(); // 状态徽标与对账摘要随目标刷新
     // 无条件先同步「同步」按钮/抽屉：切到“还没图”的新目标时也必须解锁按钮
     refreshSyncArea();
-    var files = libFiles.filter(function (f) {
+
+    var locals = libFiles.filter(function (f) {
       if (!srv) return true;
-      var rec = history[f.name];
-      if (!rec || !Array.isArray(rec.targets)) return false;
-      return rec.targets.some(function (t) { return t.host === srv.host && t.dir === srv.dir; });
+      return targetHasMd5(srv, md5Of(f.name)); // history 记录或远端清单命中
     });
 
+    var remotes = [];
+    if (srv) {
+      var idx = remoteIndex[targetKey(srv)];
+      if (idx && Array.isArray(idx.files)) {
+        var seen = {};
+        idx.files.forEach(function (f) {
+          if (f.md5) {
+            if (localNameByMd5(f.md5)) return; // 本地已有同内容 → 走本地卡片
+            if (seen[f.md5]) return; // 同 md5 只展示一条
+            seen[f.md5] = true;
+          }
+          remotes.push(f); // 无 md5 的手工文件无法与本地去重，照常展示
+        });
+        remotes.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+      }
+    }
+
+    var total = locals.length + remotes.length;
     historyCount.textContent = srv
-      ? files.length + ' 张 · ' + (srv.label || srv.host)
-      : files.length + ' 张';
+      ? total + ' 张 · ' + (srv.label || srv.host)
+      : total + ' 张';
 
     grid.textContent = ''; // 清空重建（textContent 赋值不产生 XSS 面）
-    if (!files.length) {
+    if (!total) {
       var empty = document.createElement('p');
       empty.className = 'empty';
       empty.textContent = srv
@@ -1646,7 +1668,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       grid.appendChild(empty);
       return;
     }
-    files.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
+    locals.forEach(function (f) { grid.appendChild(makeCard(f, srv)); });
+    remotes.forEach(function (f) { grid.appendChild(makeRemoteCard(f, srv)); });
   }
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
@@ -1715,6 +1738,76 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.className = 'danger';
     del.textContent = '删除';
     del.addEventListener('click', function () { removeFile(f.name, srv); });
+    ops.appendChild(del);
+    body.appendChild(ops);
+
+    card.appendChild(body);
+    return card;
+  }
+
+  // 远端独有卡片（本地无副本）：缩略图按需从目标读取；操作只有复制远端路径与删除远端文件
+  function makeRemoteCard(item, srv) {
+    var remotePath = srv.dir + '/' + item.name;
+
+    var card = document.createElement('div');
+    card.className = 'card';
+
+    var link = document.createElement('a');
+    link.className = 'thumb';
+    link.href = itemThumbUrl(item, srv);
+    link.target = '_blank';
+    link.rel = 'noopener';
+    var img = document.createElement('img');
+    img.src = link.href;
+    img.alt = item.name;
+    img.loading = 'lazy';
+    link.appendChild(img);
+    card.appendChild(link);
+
+    var body = document.createElement('div');
+    body.className = 'card-body';
+
+    var orig = document.createElement('div');
+    orig.className = 'orig';
+    orig.textContent = origFromName(item.name);
+    body.appendChild(orig);
+
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = '远端文件（本地无副本）';
+    body.appendChild(meta);
+
+    // 目标行：与历史卡的目标行同构，展示该目标上的远端路径与复制按钮
+    var list = document.createElement('div');
+    list.className = 'targets';
+    var row = document.createElement('div');
+    row.className = 'target';
+    var head = document.createElement('div');
+    head.className = 'target-head';
+    var label = document.createElement('span');
+    label.className = 'target-label';
+    label.textContent = srv.label || srv.host;
+    head.appendChild(label);
+    row.appendChild(head);
+    var pathLine = document.createElement('div');
+    pathLine.className = 'target-line';
+    var code = document.createElement('code');
+    code.textContent = remotePath;
+    pathLine.appendChild(code);
+    pathLine.appendChild(makeCopyButton(function () { return remotePath; }));
+    row.appendChild(pathLine);
+    list.appendChild(row);
+    body.appendChild(list);
+
+    body.appendChild(makeStateBadge('remote-only', '仅远端'));
+
+    var ops = document.createElement('div');
+    ops.className = 'card-ops';
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', function () { removeRemoteOnly(item, srv); });
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -2193,7 +2286,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     dropRemoteIndexFile(srcSrv, item.name);
     hint('已删除');
-    renderSyncList();
+    refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
   }
 
   // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步 / 删除远端独有）
