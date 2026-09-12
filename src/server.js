@@ -605,11 +605,25 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 卡片新增/删除动效：淡入 + 缩放（图库网格与同步抽屉共用） —— */
-@keyframes card-in { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
-@keyframes card-out { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(.92); } }
-.card-enter { animation: card-in .22s ease-out both; }
-.card-leave { animation: card-out .18s ease-in both; pointer-events: none; }
+/* —— 卡片新增/删除动效：弹跳上浮 + 抖动淡出（图库网格与同步抽屉共用） —— */
+/* 入场：自下而上弹入，60% 处轻微过冲回弹；交错延迟由页面按序号写入 animation-delay */
+@keyframes card-in {
+  0% { opacity: 0; transform: translateY(20px) scale(.82); }
+  60% { opacity: 1; transform: translateY(-4px) scale(1.03); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* 出场：先左右抖动，再缩小淡出 */
+@keyframes card-out {
+  0% { opacity: 1; transform: translateX(0) scale(1); }
+  20% { transform: translateX(-6px) scale(1); }
+  40% { transform: translateX(6px) scale(1); }
+  60% { transform: translateX(-4px) scale(1); }
+  80% { opacity: 1; transform: translateX(4px) scale(.98); }
+  100% { opacity: 0; transform: translateX(0) scale(.6); }
+}
+.card-enter { animation: card-in .42s ease-out both; }
+/* 放在 .card-enter 之后：删除时同一元素可能同时带两类，需由出场动画覆盖入场 */
+.card-leave { animation: card-out .38s ease-in both; pointer-events: none; }
 /* 系统开启「减少动态效果」时不做动画，直接呈现终态 */
 @media (prefers-reduced-motion: reduce) { .card-enter, .card-leave { animation: none; } }
 
@@ -1629,17 +1643,26 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (changed) saveJson(HISTORY_KEY, history);
   }
 
-  // 卡片新增动效的键追踪：每个容器记录上一轮已渲染的卡片键，
-  // 只有本轮「新出现」的键才加入场动效，避免每次刷新（探测/同步/切换目标）全部卡片一起动。
+  // 卡片新增动效的键追踪：每个容器记录各卡片「首次出现时间」。
+  // 只有最近新出现（窗口内）的卡片才带入场动效，避免每次刷新（探测/同步/切换目标）全部卡片一起动。
+  // 用时间窗而非「与上一轮比较」：探测与图库拉取几乎同时返回时会连续 renderGrid，
+  // 若按上一轮比较，第二次重建会判定「非新」而把动画类丢掉，导致动画被截断。
   // scope 为容器标识（'grid' / 'sync'），keys 为本轮全部卡片键；返回 isNew(key)。
+  var ENTER_WINDOW_MS = 800; // 卡片出现后保持入场动效的时间窗
   var renderedKeys = { grid: {}, sync: {} };
   function markNewCards(scope, keys) {
     var prev = renderedKeys[scope] || {};
+    var now = Date.now();
     var next = {};
-    keys.forEach(function (k) { next[k] = true; });
+    keys.forEach(function (k) { next[k] = prev[k] || now; }); // 老键保留首次出现时间，新键记当前
     renderedKeys[scope] = next;
-    return function (key) { return !prev[key]; };
+    return function (key) {
+      return next[key] != null && (now - next[key]) < ENTER_WINDOW_MS;
+    };
   }
+
+  // 交错入场延迟：按卡片序号递增、封顶，避免长列表末尾等待过久
+  function enterDelay(index) { return Math.min(index * 50, 300); }
 
   // 图库 = 当前目标下的全部图片：
   //   本机   → 全部本地图；
@@ -1694,8 +1717,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       grid.appendChild(empty);
       return;
     }
-    locals.forEach(function (f) { grid.appendChild(makeCard(f, srv, gridIsNew('L:' + f.name))); });
-    remotes.forEach(function (f) { grid.appendChild(makeRemoteCard(f, srv, gridIsNew('R:' + f.name))); });
+    locals.forEach(function (f, i) {
+      var isNew = gridIsNew('L:' + f.name);
+      var card = makeCard(f, srv, isNew);
+      if (isNew) card.style.animationDelay = enterDelay(i) + 'ms'; // 多张新图逐张浮现
+      grid.appendChild(card);
+    });
+    remotes.forEach(function (f, i) {
+      var isNew = gridIsNew('R:' + f.name);
+      var card = makeRemoteCard(f, srv, isNew);
+      if (isNew) card.style.animationDelay = enterDelay(locals.length + i) + 'ms';
+      grid.appendChild(card);
+    });
   }
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
@@ -2044,11 +2077,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 删除出场动效：给卡片追加 .card-leave，等动画播完再由 refreshHistory 重建移除。
   // 仅在网络删除成功后调用，确保不会出现「卡片已消失但实际没删掉」。
   // el 为空（异常/垫片）时直接 resolve，不阻塞删除流程。
-  var LEAVE_MS = 180; // 与 CSS .card-leave 动画时长保持一致
+  var LEAVE_MS = 380; // 与 CSS .card-leave 动画时长（抖动 + 缩小淡出）保持一致
   function animateOut(el) {
     return new Promise(function (resolve) {
       if (!el || typeof el.className !== 'string') { resolve(); return; }
-      el.className = el.className + ' card-leave';
+      el.className = el.className.replace(' card-enter', '') + ' card-leave'; // 出场动画覆盖入场
+      if (el.style) el.style.animationDelay = ''; // 清掉入场交错延迟，抖动立即开始
       setTimeout(resolve, LEAVE_MS);
     });
   }
@@ -2474,8 +2508,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     // 记录本轮抽屉卡片键（含来源）：仅新出现的条目播入场动效
     var syncKeys = missing.map(function (item) { return syncSourceSel.value + '|' + item.name; });
     var syncIsNew = markNewCards('sync', syncKeys);
-    missing.forEach(function (item) {
-      syncList.appendChild(buildSyncCard(item, srcSrv, target, syncIsNew(syncSourceSel.value + '|' + item.name)));
+    missing.forEach(function (item, i) {
+      var isNew = syncIsNew(syncSourceSel.value + '|' + item.name);
+      var card = buildSyncCard(item, srcSrv, target, isNew);
+      if (isNew) card.style.animationDelay = enterDelay(i) + 'ms'; // 多张新条目逐张浮现
+      syncList.appendChild(card);
     });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });

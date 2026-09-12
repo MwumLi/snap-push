@@ -1205,6 +1205,10 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       findNode(grid, (n) => typeof n.className === 'string' && n.className.includes('card-enter')),
       '首次渲染的卡片应带 card-enter 入场动效',
     );
+    assert.ok(
+      findNode(grid, (n) => n.style && n.style.animationDelay === '0ms'),
+      '入场卡片应写入交错 animation-delay',
+    );
   });
 
   // 回归：删除远端后，refreshHistory 不得用过期探测快照把记录“恢复”回来。
@@ -1277,8 +1281,8 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     delBtn._trigger('click'); // 触发删除 → 弹确认
     byId['confirmOk']._trigger('click'); // 确认删除
 
-    // 删除成功后先播放 180ms 出场动效，再 refreshHistory 重绘，故等待时间需覆盖动画时长
-    await new Promise((r) => setTimeout(r, 400));
+    // 删除成功后先播放 380ms 出场动效（抖动 + 缩小淡出），再 refreshHistory 重绘，故等待时间需覆盖动画时长
+    await new Promise((r) => setTimeout(r, 600));
     assert.ok(deleteCalled, '应发起远端删除请求');
     assert.ok(!hasText(grid, 'local.png'), '删除后卡片应在出场动效后消失');
     assert.ok(!hasText(grid, '远端已删'), '删除后不应残留“远端已删”记录');
