@@ -23,6 +23,7 @@ const DEFAULT_HOST = '127.0.0.1';            // 仅监听本机回环，避免�
 const DEFAULT_PORT = 8123;
 const DEFAULT_SNAP_DIR = '/tmp/snap-push';   // 本机图片落盘目录
 const MAX_BODY_BYTES = 20 * 1024 * 1024;     // 上传体积上限：20MB
+const MAX_JSON_BODY = 4 * 1024 * 1024;       // 配置/历史 JSON 请求体上限：4MB
 const SUBPROCESS_TIMEOUT_MS = 30_000;        // ssh/rsync/scp 单次执行超时
 const PROBE_TIMEOUT_MS = 10_000;             // 目标探测超时：探测是后台行为，收短避免长时间占用
 const STDERR_SUMMARY_LIMIT = 300;            // 错误信息中 stderr 摘要的最大长度
@@ -189,8 +190,14 @@ export function mimeOf(name) {
 // 身份采用「首次运行生成并持久化的随机 secret」，刻意不依赖 hostname/IP——
 // 否则切网/VPN/重启后 IP 或 hostname 变化会导致身份变化，浏览器里
 // 按实例隔离的目标/历史数据看起来「丢失」。身份文件一旦生成就稳定复用。
-const DEFAULT_ID_FILE = () =>
-  path.join(os.homedir(), '.config', 'snap-push', 'instance-id');
+const DEFAULT_CONFIG_DIR = () =>
+  path.join(os.homedir(), '.config', 'snap-push');
+
+// app 配置与数据目录：SNAP_PUSH_CONFIG_DIR 或 ~/.config/snap-push；
+// 目录内保存 instance-id（身份）、servers.json（服务器配置）、history.json（同步记录）。
+export function resolveConfigDir(opts = {}) {
+  return opts.configDir || process.env.SNAP_PUSH_CONFIG_DIR || DEFAULT_CONFIG_DIR();
+}
 
 // 默认路径身份 secret 的进程内缓存：避免每次请求都读一次文件
 let cachedSecret = null;
@@ -216,12 +223,13 @@ export function getOrCreateSecret(opts = {}) {
   if (opts.secret) return opts.secret;
   const fromEnv = process.env.SNAP_PUSH_ID;
   if (fromEnv) return fromEnv;
-  const idFile = opts.secretFile || process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE();
+  const configDir = resolveConfigDir(opts);
+  const defaultFile = path.join(configDir, 'instance-id');
+  const idFile = opts.secretFile || process.env.SNAP_PUSH_ID_FILE || defaultFile;
+  // 仅默认路径参与进程内缓存；测试注入自定义路径时每次直读，避免串缓存
+  const cacheable = !opts.secretFile && !process.env.SNAP_PUSH_ID_FILE;
   try {
-    // 进程内缓存只用于默认文件路径；测试注入自定义路径时每次直读，避免串缓存
-    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
-      if (cachedSecret) return cachedSecret;
-    }
+    if (cacheable && cachedSecret) return cachedSecret;
     let secret = null;
     try {
       secret = fs.readFileSync(idFile, 'utf8').trim();
@@ -233,9 +241,7 @@ export function getOrCreateSecret(opts = {}) {
       fs.mkdirSync(path.dirname(idFile), { recursive: true });
       fs.writeFileSync(idFile, secret + '\n', { mode: 0o600 });
     }
-    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
-      cachedSecret = secret;
-    }
+    if (cacheable) cachedSecret = secret;
     return secret;
   } catch {
     return ''; // home 不可写等：交由调用方用 hostname 兜底
@@ -505,6 +511,58 @@ export async function pullToLocal(localPath, name, { host, user, dir }) {
   }
 
   throw new Error(`rsync 拉取失败（退出码 ${rsyncResult.code}）：${summarizeStderr(rsyncResult.stderr)}`);
+}
+
+// =====================================================================
+// 三·五、服务端 JSON 存储：app 配置与数据目录下的持久化文件
+// =====================================================================
+
+/**
+ * 通用 JSON 存储：文件缺失、内容损坏或形状不符时回退 fallback，绝不抛异常。
+ *
+ * update(mutator) 串行 read-modify-write：mutator 同步修改 state 并返回结果，
+ * 随后原子写（写同目录临时文件 → rename 覆盖），避免并发丢更新与半截文件。
+ * 每个 store 一条内部写链，同一文件不交叉；不同文件互不阻塞。
+ *
+ * @param {string} file 目标文件绝对路径
+ * @param {any} fallback 期望形状（数组或对象）；read 后形状不符也回退
+ * @param {(value:any)=>boolean} [isValid] 自定义形状校验；缺省按 fallback 类型判断
+ */
+export function createJsonStore(file, fallback, isValid) {
+  const check = isValid || ((v) =>
+    Array.isArray(fallback)
+      ? Array.isArray(v)
+      : (v !== null && typeof v === 'object' && !Array.isArray(v)));
+  let chain = Promise.resolve();
+
+  function read() {
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      return check(value) ? value : fallback;
+    } catch {
+      return fallback; // 文件不存在 / 内容损坏：回退默认值
+    }
+  }
+
+  function writeSync(state) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
+
+  function update(mutator) {
+    const job = chain.then(() => {
+      const state = read();
+      const result = mutator(state);
+      writeSync(state);
+      return result;
+    });
+    chain = job.catch(() => {}); // 吞掉失败，保持写链不中断
+    return job;
+  }
+
+  return { read, update };
 }
 
 // =====================================================================
@@ -2832,6 +2890,20 @@ function safeDecode(segment) {
   }
 }
 
+/**
+ * 读取并解析 JSON 请求体（上限 MAX_JSON_BODY）。
+ * 非法 JSON / 非对象返回 null，由调用方按 400 处理；超限抛 413。
+ */
+async function readJsonBody(req) {
+  const buf = await readBodyWithLimit(req, MAX_JSON_BODY);
+  try {
+    const value = JSON.parse(buf.toString('utf8'));
+    return (value !== null && typeof value === 'object') ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 确保 snapDir 存在（幂等；upload 与 library 前调用） */
 async function ensureDir(dir) {
   await fs.promises.mkdir(dir, { recursive: true });
@@ -3229,6 +3301,153 @@ async function handleDeleteFile(res, name, ctx) {
   sendJson(res, 200, { ok: true });
 }
 
+// =====================================================================
+// 四·五、服务器配置 / 同步记录的持久化接口
+// =====================================================================
+
+/**
+ * 校验服务器配置字段：host/dir 必填且过白名单，user/urlBase 可选。
+ * partial=true 时仅校验请求体中出现的字段（供 PATCH 局部更新用）。
+ * 返回 { ok:true } 或 { ok:false, error }。
+ */
+export function validateServerFields(input, partial = false) {
+  const has = (k) => input[k] !== undefined;
+  if (!partial || has('host')) {
+    if (validateHost(input.host) === null) {
+      return { ok: false, error: 'host 不合法：仅允许字母、数字、点、下划线、连字符' };
+    }
+  }
+  if (has('user') && input.user !== '' && validateUser(input.user) === null) {
+    return { ok: false, error: 'user 不合法：仅允许字母、数字、点、下划线、连字符' };
+  }
+  if (!partial || has('dir')) {
+    if (validateDir(input.dir) === null) {
+      return { ok: false, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' };
+    }
+  }
+  if (has('urlBase') && input.urlBase) {
+    if (typeof input.urlBase !== 'string' || !/^https?:\/\//.test(input.urlBase) || /\s/.test(input.urlBase)) {
+      return { ok: false, error: 'urlBase 不合法：需形如 https://cdn.example.com/snap' };
+    }
+  }
+  return { ok: true };
+}
+
+/** 校验 history 单条：orig 为字符串、targets 为数组；target 的 host/dir 非空时过白名单 */
+function isValidHistoryEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  if (typeof entry.orig !== 'string' || !Array.isArray(entry.targets)) return false;
+  for (const t of entry.targets) {
+    if (!t || typeof t !== 'object') return false;
+    if (t.host && validateHost(t.host) === null) return false;
+    if (t.dir && validateDir(t.dir) === null) return false;
+  }
+  return true;
+}
+
+/** GET /api/servers：返回全部服务器配置 */
+async function handleListServers(res, ctx) {
+  sendJson(res, 200, { ok: true, servers: ctx.serversStore.read() });
+}
+
+/** POST /api/servers：新增一条（id 由客户端生成）；id 重复返回 409 */
+async function handleCreateServer(req, res, ctx) {
+  const body = await readJsonBody(req);
+  if (!body || typeof body.id !== 'string' || !body.id) {
+    return sendJson(res, 400, { ok: false, error: 'id 必填' });
+  }
+  const v = validateServerFields(body);
+  if (!v.ok) return sendJson(res, 400, { ok: false, error: v.error });
+  const entry = {
+    id: body.id,
+    label: String(body.label || '').slice(0, 200),
+    host: body.host,
+    user: body.user || 'root',
+    dir: body.dir,
+    urlBase: body.urlBase || '',
+  };
+  let duplicated = false;
+  await ctx.serversStore.update((list) => {
+    if (list.some((s) => s.id === entry.id)) { duplicated = true; return; }
+    list.push(entry);
+  });
+  if (duplicated) return sendJson(res, 409, { ok: false, error: '服务器配置 id 已存在' });
+  sendJson(res, 200, { ok: true, server: entry });
+}
+
+/** PATCH /api/servers/:id：局部更新；不存在返回 404 */
+async function handleUpdateServer(req, res, id, ctx) {
+  const body = await readJsonBody(req);
+  if (!body) return sendJson(res, 400, { ok: false, error: '请求体不合法' });
+  const v = validateServerFields(body, true);
+  if (!v.ok) return sendJson(res, 400, { ok: false, error: v.error });
+  let updated = null;
+  await ctx.serversStore.update((list) => {
+    const s = list.find((x) => x.id === id);
+    if (!s) return;
+    if (body.label !== undefined) s.label = String(body.label).slice(0, 200);
+    for (const k of ['host', 'user', 'dir', 'urlBase']) {
+      if (body[k] !== undefined) s[k] = body[k];
+    }
+    updated = s;
+  });
+  if (!updated) return sendJson(res, 404, { ok: false, error: '服务器配置不存在' });
+  sendJson(res, 200, { ok: true, server: updated });
+}
+
+/** DELETE /api/servers/:id：删除配置（历史记录保留）；幂等 */
+async function handleDeleteServer(res, id, ctx) {
+  await ctx.serversStore.update((list) => {
+    const i = list.findIndex((s) => s.id === id);
+    if (i >= 0) list.splice(i, 1);
+  });
+  sendJson(res, 200, { ok: true });
+}
+
+/** GET /api/history：返回全部同步记录 */
+async function handleListHistory(res, ctx) {
+  sendJson(res, 200, { ok: true, history: ctx.historyStore.read() });
+}
+
+/** PUT /api/history/:name：覆盖式 upsert 单条（name 必须为合法存储名） */
+async function handlePutHistory(req, res, name, ctx) {
+  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  const body = await readJsonBody(req);
+  if (!isValidHistoryEntry(body)) {
+    return sendJson(res, 400, { ok: false, error: '请求体不合法：需为 { orig, targets[] }' });
+  }
+  await ctx.historyStore.update((h) => { h[name] = { orig: body.orig, targets: body.targets }; });
+  sendJson(res, 200, { ok: true });
+}
+
+/** DELETE /api/history/:name：删除单条；幂等 */
+async function handleDeleteHistory(res, name, ctx) {
+  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  await ctx.historyStore.update((h) => { delete h[name]; });
+  sendJson(res, 200, { ok: true });
+}
+
+/** POST /api/history/batch：{ upserts:{name:entry}, deletes:[name] } 原子应用（对账/批量清理用） */
+async function handleBatchHistory(req, res, ctx) {
+  const body = await readJsonBody(req);
+  if (!body) return sendJson(res, 400, { ok: false, error: '请求体不合法' });
+  const upserts = (body.upserts && typeof body.upserts === 'object' && !Array.isArray(body.upserts))
+    ? body.upserts : {};
+  const deletes = Array.isArray(body.deletes) ? body.deletes : [];
+  for (const [name, entry] of Object.entries(upserts)) {
+    if (!isValidStoredName(name) || !isValidHistoryEntry(entry)) {
+      return sendJson(res, 400, { ok: false, error: `upserts 含非法项：${name}` });
+    }
+  }
+  await ctx.historyStore.update((h) => {
+    for (const [name, entry] of Object.entries(upserts)) {
+      h[name] = { orig: entry.orig, targets: entry.targets };
+    }
+    for (const name of deletes) delete h[name];
+  });
+  sendJson(res, 200, { ok: true });
+}
+
 /**
  * 路由分发。用 WHATWG URL 解析：它会规范化 ".." 路径段，
  * 例如 /files/../etc/passwd 会变成 /etc/passwd 落进 404，天然免疫目录穿越。
@@ -3268,6 +3487,30 @@ async function route(req, res, ctx) {
   if (req.method === 'GET' && pathname === '/api/library') {
     return handleLibrary(res, ctx);
   }
+  // —— 服务器配置（app 配置目录 servers.json）——
+  if (pathname === '/api/servers') {
+    if (req.method === 'GET') return handleListServers(res, ctx);
+    if (req.method === 'POST') return handleCreateServer(req, res, ctx);
+  }
+  if (pathname.startsWith('/api/servers/')) {
+    const id = safeDecode(pathname.slice('/api/servers/'.length));
+    if (id === null || id === '') return sendJson(res, 400, { ok: false, error: '路径不合法' });
+    if (req.method === 'PATCH') return handleUpdateServer(req, res, id, ctx);
+    if (req.method === 'DELETE') return handleDeleteServer(res, id, ctx);
+  }
+  // —— 同步记录（app 数据目录 history.json）——
+  if (pathname === '/api/history') {
+    if (req.method === 'GET') return handleListHistory(res, ctx);
+  }
+  if (pathname === '/api/history/batch' && req.method === 'POST') {
+    return handleBatchHistory(req, res, ctx);
+  }
+  if (pathname.startsWith('/api/history/')) {
+    const name = safeDecode(pathname.slice('/api/history/'.length));
+    if (name === null || name === '') return sendJson(res, 400, { ok: false, error: '路径不合法' });
+    if (req.method === 'PUT') return handlePutHistory(req, res, name, ctx);
+    if (req.method === 'DELETE') return handleDeleteHistory(res, name, ctx);
+  }
   if (pathname.startsWith('/files/')) {
     // 解码后的文件名必须严格匹配 <md5>-<安全名>，否则一律 400
     const name = safeDecode(pathname.slice('/files/'.length));
@@ -3281,12 +3524,15 @@ async function route(req, res, ctx) {
  * 创建 snap-push HTTP 服务（只创建不监听，便于测试注入目录与端口）。
  * @param {object} [options]
  * @param {string} [options.snapDir] 本机落盘目录，默认取环境变量 SNAP_PUSH_DIR 或 /tmp/snap-push
+ * @param {string} [options.configDir] app 配置与数据目录，默认 SNAP_PUSH_CONFIG_DIR 或 ~/.config/snap-push
  * @param {number} [options.maxBody] 上传体积上限（字节），默认 20MB
  * @returns {import('node:http').Server}
  */
 export function createServer(options = {}) {
   const snapDir = options.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR;
   const maxBody = options.maxBody || MAX_BODY_BYTES;
+  // app 配置与数据目录：servers.json（服务器配置）/ history.json（同步记录）
+  const configDir = resolveConfigDir(options);
   // 实例身份在服务创建时计算一次（可注入 secret/secretFile 便于测试与固定复现）
   const svcId = computeServiceId(options);
 
@@ -3298,7 +3544,15 @@ export function createServer(options = {}) {
     return next;
   };
 
-  const ctx = { snapDir, maxBody, enqueue, svcId };
+  const ctx = {
+    snapDir,
+    maxBody,
+    enqueue,
+    svcId,
+    configDir,
+    serversStore: createJsonStore(path.join(configDir, 'servers.json'), []),
+    historyStore: createJsonStore(path.join(configDir, 'history.json'), {}),
+  };
   const server = http.createServer((req, res) => {
     route(req, res, ctx).catch((err) => {
       // 统一兜底：抛错处可携带 statusCode（如 413），其余按 500 处理
