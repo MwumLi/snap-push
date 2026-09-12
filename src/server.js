@@ -2514,12 +2514,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
   }
 
-  // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步 / 删除远端独有）
+  // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步）
   function buildSyncCard(item, srcSrv, target, isNew) {
     var card = document.createElement('div');
     card.className = isNew ? 'card sync-card card-enter' : 'card sync-card';
 
-    var localName = item.md5 ? localNameByMd5(item.md5) : null;
     var href = itemThumbUrl(item, srcSrv);
 
     // 大缩略图：点击新窗口打开原图（同历史卡片）
@@ -2560,7 +2559,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     list.appendChild(none);
     body.appendChild(list);
 
-    // 操作行：左侧勾选 + 右侧同步（远端独有再加删除）
+    // 操作行：左侧勾选 + 右侧同步
     var ops = document.createElement('div');
     ops.className = 'card-ops';
 
@@ -2589,17 +2588,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     btn.addEventListener('click', function () { syncItemRow(item, srcSrv, target, btn, errEl); });
     ops.appendChild(btn);
 
-    // 远端独有（本地无字节）时提供删除：只删远端文件
-    if (srcSrv && !localName) {
-      var delBtn = document.createElement('button');
-      delBtn.type = 'button';
-      delBtn.className = 'danger';
-      delBtn.textContent = '删除';
-      delBtn.disabled = !!probeBusy[targetKey(srcSrv)]; // 探测在途时置灰，避免用旧快照删除
-      delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv, card, syncList, 'sync'); });
-      card._delBtn = delBtn; // 复用卡片时就地刷新置灰状态
-      ops.appendChild(delBtn);
-    }
     body.appendChild(ops);
 
     body.appendChild(errEl);
@@ -2617,7 +2605,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     syncTitle.textContent = srcLabel + ' → ' + tgtLabel;
     var missing = missingItems();
     var entries = [];
-    var srcBusy = !!(srcSrv && probeBusy[targetKey(srcSrv)]);
 
     if (missing === null) {
       // 来源服务器还没探测：给一个手动探测入口
@@ -2669,10 +2656,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       });
     });
     reconcileCards(syncList, 'sync', entries);
-    // 探测在途状态不参与签名：就地刷新删除按钮置灰与勾选可用性
+    // 探测在途状态不参与签名：就地刷新勾选可用性
     (prevCards.sync || []).forEach(function (c) {
       if (!c.el) return;
-      if (c.el._delBtn) c.el._delBtn.disabled = srcBusy;
       if (c.el._check) c.el._check.disabled = syncBusy;
     });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
