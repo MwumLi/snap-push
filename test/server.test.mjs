@@ -715,6 +715,9 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes('filter: blur(5px)'), '入场动效应含“模糊到清晰”');
     assert.ok(html.includes('rotate(4deg)'), '出场动效应含“旋转滑出”');
     assert.ok(html.includes('prefers-reduced-motion'), '应尊重系统“减少动态效果”设置');
+    // FLIP 移动过渡：离开卡片以绝对定位钉在原位，容器必须是定位上下文（锚点）
+    assert.ok(html.includes('minmax(230px, 1fr)); gap: 14px; position: relative; }'), '图库网格应为定位上下文（FLIP 锚点）');
+    assert.ok(html.includes('flex-direction: column; gap: 10px; position: relative; }'), '抽屉列表应为定位上下文（FLIP 锚点）');
     // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
     assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
     assert.ok(!html.includes('badge-verified'), '不应再引用 badge-verified');
