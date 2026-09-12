@@ -38,7 +38,8 @@ node snap-push/server.mjs
 | `SNAP_PUSH_HOST` | `127.0.0.1` | Listen address (loopback only by default) |
 | `SNAP_PUSH_PORT` | `8123` | Listen port |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
-| `SNAP_PUSH_ID_FILE` | `~/.config/snap-push/instance-id` | File persisting the per-instance identity secret (auto-created on first run) |
+| `SNAP_PUSH_CONFIG_DIR` | `~/.config/snap-push` | App config & data dir: `instance-id` (identity), `servers.json` (server configs), `history.json` (sync records) |
+| `SNAP_PUSH_ID_FILE` | `<SNAP_PUSH_CONFIG_DIR>/instance-id` | File persisting the per-instance identity secret (auto-created on first run); overrides the config-dir location |
 | `SNAP_PUSH_ID` | *(empty)* | Pin a fixed instance secret (skips reading/writing the identity file) |
 
 > **On `SNAP_PUSH_HOST`**: keep the default `127.0.0.1`. This tool has **no authentication** — it is meant for local dev convenience, and exposing it to a network is unsafe (and not planned). To reach it from another machine, run snap-push on your dev host bound to loopback and forward the port over SSH, then open <http://127.0.0.1:8123> locally:
@@ -46,6 +47,16 @@ node snap-push/server.mjs
 > ```bash
 > ssh -N -L 8123:127.0.0.1:8123 user@dev-host
 > ```
+
+## Config & data directory
+
+Server configs and sync history live **server-side** under `SNAP_PUSH_CONFIG_DIR` (default `~/.config/snap-push`), so every browser pointing at the same snap-push instance shares the same targets and history:
+
+- `servers.json` — target server configs (id / nickname / host / user / dir / URL prefix)
+- `history.json` — which image was pushed to which target (path / URL / time / method)
+- `instance-id` — the per-instance identity secret
+
+The browser only keeps lightweight per-browser preferences in localStorage: the currently selected target and a remote-listing cache (`remoteIndex`), both namespaced by instance (`snap-push@<hash>.*`).
 
 ## Usage
 
@@ -68,6 +79,14 @@ node snap-push/server.mjs
 | `GET` | `/api/remote-file` | Fetch a remote file's bytes on demand (thumbnail / preview); replays the local cache when present |
 | `DELETE` | `/api/remote-file` | Delete a single file on the remote target (idempotent) |
 | `GET` | `/api/library` | Local library listing |
+| `GET` | `/api/servers` | List server configs (from `servers.json`) |
+| `POST` | `/api/servers` | Create a server config (409 if the id already exists) |
+| `PATCH` | `/api/servers/:id` | Update a server config (partial fields) |
+| `DELETE` | `/api/servers/:id` | Delete a server config (history records are kept) |
+| `GET` | `/api/history` | List sync records (from `history.json`) |
+| `PUT` | `/api/history/:name` | Upsert one record (`{orig, targets[]}`) |
+| `DELETE` | `/api/history/:name` | Delete one record |
+| `POST` | `/api/history/batch` | Apply `{upserts, deletes}` atomically (reconciliation / bulk cleanup) |
 | `GET` | `/files/<name>` | Read a local-library file's bytes |
 | `DELETE` | `/files/<name>` | Delete a local-library file |
 | `GET` | `/health` | Health check and instance identity |
@@ -113,7 +132,7 @@ One picture tells the whole story: an image goes from the browser to the local s
 - **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails. Instant-skip logic only looks at the remote — it is independent of local storage.
 - **What does "remote-only" mean?** A file that exists on the target server but has no copy in the local library (perhaps pushed by another client). It only appears in the **Sync** drawer, with its thumbnail read from the remote on demand; pull it back locally to display and redistribute it normally.
 - **Does deleting remove remote files too?** Under a server target, deletion affects only that target. Under the local target, only the local file is removed by default; tick **Also delete copies on all servers** in the dialog to cascade (the local file is deleted only after every remote deletion succeeds).
-- **Where are my configs / history stored?** In the browser's localStorage, namespaced per snap-push instance (header badge `hostname  #hash`). The instance identity is a random secret persisted at `~/.config/snap-push/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID` (or delete it and start clean in the browser).
+- **Where are my configs / history stored?** On the server, under `SNAP_PUSH_CONFIG_DIR` (default `~/.config/snap-push`): `servers.json` holds the target configs and `history.json` the sync records, so multiple browsers share them. The browser only keeps the current target and a remote-listing cache in localStorage (namespaced per instance, header badge `hostname  #hash`). The instance identity is a random secret persisted at `<SNAP_PUSH_CONFIG_DIR>/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID`.
 
 ## Development
 

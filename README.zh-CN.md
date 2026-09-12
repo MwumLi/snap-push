@@ -38,7 +38,8 @@ node snap-push/server.mjs
 | `SNAP_PUSH_HOST` | `127.0.0.1` | 监听地址（默认仅本机回环） |
 | `SNAP_PUSH_PORT` | `8123` | 监听端口 |
 | `SNAP_PUSH_DIR` | `/tmp/snap-push` | 本机图片落盘目录（页面预览/图库用） |
-| `SNAP_PUSH_ID_FILE` | `~/.config/snap-push/instance-id` | 实例身份 secret 的持久化文件位置（首次运行自动创建） |
+| `SNAP_PUSH_CONFIG_DIR` | `~/.config/snap-push` | app 配置与数据目录：`instance-id`（身份）、`servers.json`（服务器配置）、`history.json`（同步记录） |
+| `SNAP_PUSH_ID_FILE` | `<SNAP_PUSH_CONFIG_DIR>/instance-id` | 实例身份 secret 的持久化文件位置（首次运行自动创建）；可覆盖配置目录内的默认位置 |
 | `SNAP_PUSH_ID` | （空） | 固定实例 secret（跳过身份文件的读写） |
 
 > **关于 `SNAP_PUSH_HOST` 的提醒**：保持默认 `127.0.0.1`。本工具**没有任何认证**，定位是本地研发提效的小工具，暴露到网络不安全，也暂不计划支持。若要在服务器/远程机器上使用，请在开发机上保持回环监听，用 ssh 把本地端口转发过去，再在本地浏览器打开 <http://127.0.0.1:8123>：
@@ -46,6 +47,16 @@ node snap-push/server.mjs
 > ```bash
 > ssh -N -L 8123:127.0.0.1:8123 user@开发机
 > ```
+
+## 配置与数据目录
+
+服务器配置与同步记录都存在**服务端** `SNAP_PUSH_CONFIG_DIR`（默认 `~/.config/snap-push`）下，因此指向同一 snap-push 实例的多个浏览器共享同一份目标与历史：
+
+- `servers.json` —— 服务器配置（id / 昵称 / IP / 用户名 / 目录 / URL 前缀）
+- `history.json` —— 每张图推送到了哪些目标（路径 / URL / 时间 / 方式）
+- `instance-id` —— 实例身份 secret
+
+浏览器 localStorage 只保留轻量的「本浏览器」偏好：当前选中的目标，以及远端清单缓存（`remoteIndex`），均按实例命名空间隔离（`snap-push@<hash>.*`）。
 
 ## 使用说明
 
@@ -68,6 +79,14 @@ node snap-push/server.mjs
 | `GET` | `/api/remote-file` | 按需读取远端文件字节（缩略图/预览），命中本地缓存则直接回放 |
 | `DELETE` | `/api/remote-file` | 删除远端目标上的单个文件（幂等） |
 | `GET` | `/api/library` | 本机图库清单 |
+| `GET` | `/api/servers` | 列出服务器配置（来自 `servers.json`） |
+| `POST` | `/api/servers` | 新增服务器配置（id 已存在返回 409） |
+| `PATCH` | `/api/servers/:id` | 局部更新服务器配置 |
+| `DELETE` | `/api/servers/:id` | 删除服务器配置（历史记录保留） |
+| `GET` | `/api/history` | 列出同步记录（来自 `history.json`） |
+| `PUT` | `/api/history/:name` | 覆盖式 upsert 单条记录（`{orig, targets[]}`） |
+| `DELETE` | `/api/history/:name` | 删除单条记录 |
+| `POST` | `/api/history/batch` | 原子应用 `{upserts, deletes}`（对账 / 批量清理用） |
 | `GET` | `/files/<name>` | 读取本机图库文件字节 |
 | `DELETE` | `/files/<name>` | 删除本机图库文件 |
 | `GET` | `/health` | 健康检查与实例标识 |
@@ -113,7 +132,7 @@ node snap-push/server.mjs
 - **本地目录（`SNAP_PUSH_DIR`）的作用**：存预览图与图库记录，供页面显示缩略图；妙传判断只看远端，与本地保存无关。
 - **「远端独有」是什么意思？** 目标服务器上存在、但本机图库没有副本的文件（可能是别的客户端推的）。它只出现在「同步」抽屉里，缩略图按需从远端读取；拉回本地后即可正常显示与再分发。
 - **删除会不会连带删远端？** 在服务器目标下删除只影响该目标；在本机目标下默认只删本地，弹窗里勾选「同时删除所有服务器上的副本」才会级联（远端全部删除成功后才删本地）。
-- **我的服务器配置/历史存在哪？** 存在浏览器 localStorage，并按 snap-push 实例命名空间隔离（头部徽标 `hostname  #hash`）。实例身份是一个持久化在 `~/.config/snap-push/instance-id` 的随机 secret，刻意不依赖 IP——切换网络/VPN/重启都不会让你保存的目标「丢失」。身份文件丢了？可用 `SNAP_PUSH_ID` 固定一个（或删除后浏览器里重新开始）。
+- **我的服务器配置/历史存在哪？** 存在服务端 `SNAP_PUSH_CONFIG_DIR`（默认 `~/.config/snap-push`）下：`servers.json` 存目标配置、`history.json` 存同步记录，多个浏览器共享。浏览器 localStorage 只保留当前目标与远端清单缓存（按实例命名空间隔离，头部徽标 `hostname  #hash`）。实例身份是一个持久化在 `<SNAP_PUSH_CONFIG_DIR>/instance-id` 的随机 secret，刻意不依赖 IP——切换网络/VPN/重启都不会让你保存的目标「丢失」。身份文件丢了？可用 `SNAP_PUSH_ID` 固定一个。
 
 ## 开发
 
