@@ -579,10 +579,10 @@ function sendJson(res, status, obj) {
  * 内嵌单页应用（设计文档第 6 节）：原生 JS + 内联 CSS，无任何外部资源。
  *
  * 页面结构：
- *   - 顶部：目标下拉（本机 + localStorage 服务器配置）与「⚙ 管理」配置面板（增/改/删）；
+ *   - 顶部：目标下拉（本机 + 服务端 servers.json 里的服务器配置）与「⚙ 管理」配置面板（增/改/删）；
  *   - 上传区：文件选择 / 拖拽 / Ctrl+V 粘贴截图，逐文件 POST /upload 并展示结果；
  *   - 图库：按当前目标渲染全部图片（本地存在 + 远端独有），
- *     /api/library 与 localStorage 历史（snap-push.history）求交，远端独有取自 remoteIndex，
+ *     /api/library 与服务端 history.json（经 /api/history 读取）求交，远端独有取自 remoteIndex，
  *     按当前目标（host+dir）过滤，支持复制路径/URL、删除（联动清历史记录）、对账清理。
  *
  * 安全约定：动态内容一律 createElement + textContent，绝不拼接 innerHTML；
@@ -820,19 +820,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 (function () {
   'use strict';
 
-  // =============== localStorage 封装 ===============
-  // 读取失败（未存过/内容损坏/隐私模式禁用）时静默回退默认值；
-  // 写入失败只是不持久化，都不阻断页面功能。
-  //
+  // =============== 浏览器本地存储（仅用户偏好与缓存） ===============
+  // 服务器配置与同步记录已改为存服务端（~/.config/snap-push/servers.json / history.json），
+  // 浏览器 localStorage 只保留两类「本浏览器」数据：
+  //   - target：上次选中的目标（用户偏好）；
+  //   - remoteIndex：远端清单缓存（可随时重建）。
   // 存储键按「本实例服务 ID」命名空间隔离：同一浏览器经 ssh -L 先后指向
-  // 不同机器的 snap-push 时，地址都是 127.0.0.1:8123（同源），各实例的
-  // 配置/历史/目标记忆互不串扰；data-svc 缺失（旧缓存页面）则回退旧键名。
+  // 不同机器的 snap-push 时，地址都是 127.0.0.1:8123（同源），各实例的目标记忆/
+  // 远端缓存互不串扰；data-svc 缺失（旧缓存页面）则回退旧键名。
   var svcHash = (document.body && document.body.getAttribute('data-svc')) || '';
   function storageKey(base) {
     return svcHash ? 'snap-push@' + svcHash + '.' + base : 'snap-push.' + base;
   }
-  var SERVERS_KEY = storageKey('servers');
-  var HISTORY_KEY = storageKey('history');
   var TARGET_KEY = storageKey('target'); // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
   var REMOTE_INDEX_KEY = storageKey('remoteIndex'); // 远端清单缓存：{"<host>|<dir>": {fetchedAt, files}}
 
@@ -854,12 +853,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 一次性迁移：升级到「按实例命名空间」之前，旧键（snap-push.*）里可能存有
-  // 配置/历史/目标。仅当本实例命名空间尚无数据时，把旧键数据复制过去（只复制不删除，安全）。
+  // 一次性迁移：升级到「按实例命名空间」之前，旧键（snap-push.*）里可能存有目标选择。
+  // 仅当本实例命名空间尚无数据时，把旧键数据复制过去（只复制不删除，安全）。
+  // 注：servers/history 已迁到服务端，不再读取浏览器旧键。
   function legacyKey(base) { return 'snap-push.' + base; }
   function migrateLegacy() {
     if (!svcHash) return; // 旧缓存页面本身就在用旧键，无需迁移
-    ['servers', 'history', 'target'].forEach(function (base) {
+    ['target'].forEach(function (base) {
       var ns = storageKey(base);
       if (loadJson(ns, null) !== null) return; // 命名空间已有数据，不覆盖
       var raw = null;
@@ -872,12 +872,49 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
   migrateLegacy();
 
+  // =============== 服务端配置/历史：读写封装 ===============
+  // 统一 JSON 请求：非 2xx 或 ok:false 时抛中文错误，由调用方决定提示与否。
+  async function apiJson(url, options) {
+    var res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || data.ok === false) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+    return data;
+  }
+  function jsonOpts(method, body) {
+    return { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  }
+  async function loadServers() {
+    var data = await apiJson('/api/servers');
+    servers = Array.isArray(data.servers) ? data.servers : [];
+  }
+  async function loadHistory() {
+    var data = await apiJson('/api/history');
+    history = (data.history && typeof data.history === 'object' && !Array.isArray(data.history)) ? data.history : {};
+  }
+  // 写失败只提示、不阻断：内存态已乐观更新，刷新后以服务端为准
+  function persistFail(e) {
+    hint('保存到服务端失败：' + (e && e.message ? e.message : e), true);
+  }
+  function createServerRemote(s) { return apiJson('/api/servers', jsonOpts('POST', s)); }
+  function updateServerRemote(id, patch) { return apiJson('/api/servers/' + encodeURIComponent(id), jsonOpts('PATCH', patch)); }
+  function deleteServerRemote(id) { return apiJson('/api/servers/' + encodeURIComponent(id), { method: 'DELETE' }); }
+  function saveHistoryEntry(name) { return apiJson('/api/history/' + encodeURIComponent(name), jsonOpts('PUT', history[name])); }
+  function deleteHistoryEntry(name) { return apiJson('/api/history/' + encodeURIComponent(name), { method: 'DELETE' }); }
+  function batchHistory(payload) { return apiJson('/api/history/batch', jsonOpts('POST', payload)); }
+
   // =============== 页面状态 ===============
-  var servers = loadJson(SERVERS_KEY, []); // [{id,label,host,user,dir,urlBase}]
-  if (!Array.isArray(servers)) servers = [];
+  var servers = []; // 服务端 servers.json 的镜像：[{id,label,host,user,dir,urlBase}]
   // history 结构：{"<localName>": {orig, targets: [{key,label,host,dir,remotePath,url,method,time}]}}
-  var history = loadJson(HISTORY_KEY, {});
-  if (typeof history !== 'object' || history === null || Array.isArray(history)) history = {};
+  var history = {}; // 服务端 history.json 的镜像
+  var serverStatus = {}; // 内存态探测状态：serverId -> {reachable,dirExists,hasRsync,error,lastProbe}（不持久化）
   var libFiles = []; // 最近一次 GET /api/library 的文件清单
   var remoteIndex = loadJson(REMOTE_INDEX_KEY, {}); // 远端清单缓存，见 REMOTE_INDEX_KEY
   if (typeof remoteIndex !== 'object' || remoteIndex === null || Array.isArray(remoteIndex)) remoteIndex = {};
@@ -1143,10 +1180,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   //   2) 有记录但远端无 → 标 stale（仅当该记录在本次探测开始前就已确认，避免把探测期间新上传误标）；
   //   3) 本地有字节、远端有同 md5、却缺记录 → 补录 recovered（同 md5 只补“规范文件”一条）。
   // probeStartedAt：本次探测发起时间，用于竞态判断。
-  function reconcileWithRemote(srv, files, probeStartedAt) {
+  async function reconcileWithRemote(srv, files, probeStartedAt) {
     var byMd5 = {};
     (files || []).forEach(function (f) { if (f.md5) byMd5[f.md5] = f.name; });
-    var changed = false;
+    var touched = {}; // 本次发生变更的 history 条目名 → 末尾一次性批量落库
 
     // 1) 已有记录的：确认 / 失效
     libFiles.forEach(function (lf) {
@@ -1156,13 +1193,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       var t = findTargetRec(lf.name, srv);
       if (!t) return;
       if (remoteName) {
-        if (t.stale) { delete t.stale; changed = true; }
-        if (t.remoteName !== remoteName) { t.remoteName = remoteName; changed = true; }
+        if (t.stale) { delete t.stale; touched[lf.name] = true; }
+        if (t.remoteName !== remoteName) { t.remoteName = remoteName; touched[lf.name] = true; }
         t.verifiedAt = Date.now();
-        changed = true;
+        touched[lf.name] = true;
       } else if (!t.stale && (!t.verifiedAt || t.verifiedAt < probeStartedAt)) {
         t.stale = true; // 远端已删：标记失效
-        changed = true;
+        touched[lf.name] = true;
       }
     });
 
@@ -1187,24 +1224,29 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         rec = history[lfName] = { orig: origOf(lfName), targets: [] };
       }
       rec.targets.push(makeRecoveredTarget(srv, byMd5[md5]));
-      changed = true;
+      touched[lfName] = true;
     });
 
-    if (changed) saveJson(HISTORY_KEY, history);
+    var names = Object.keys(touched);
+    if (!names.length) return;
+    var upserts = {};
+    names.forEach(function (n) { upserts[n] = history[n]; });
+    try {
+      await batchHistory({ upserts: upserts });
+    } catch (e) {
+      persistFail(e);
+    }
   }
 
-  // 记录探测状态到 servers[i].status（持久化“上次已知”，下次打开先显示再刷新）
+  // 记录探测状态到内存（属及时性信息，不持久化；刷新后重新探测）
   function saveServerStatus(srv, patch) {
-    var s = serverById(srv.id);
-    if (!s) return;
-    s.status = s.status || {};
-    for (var k in patch) s.status[k] = patch[k];
-    s.status.lastProbe = Date.now();
-    saveJson(SERVERS_KEY, servers);
+    var st = serverStatus[srv.id] || (serverStatus[srv.id] = {});
+    for (var k in patch) st[k] = patch[k];
+    st.lastProbe = Date.now();
   }
 
-  // 探测成功：落 remoteIndex、写状态、按目标对账
-  function applyProbe(srv, data, probeStartedAt) {
+  // 探测成功：落 remoteIndex、写内存状态、按目标对账
+  async function applyProbe(srv, data, probeStartedAt) {
     remoteIndex[targetKey(srv)] = { fetchedAt: Date.now(), files: data.files || [] };
     saveJson(REMOTE_INDEX_KEY, remoteIndex);
     saveServerStatus(srv, {
@@ -1213,7 +1255,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       hasRsync: !!data.hasRsync,
       error: '',
     });
-    reconcileWithRemote(srv, data.files || [], probeStartedAt);
+    await reconcileWithRemote(srv, data.files || [], probeStartedAt);
   }
 
   // 探测失败：只记状态，绝不改历史记录（否则会把整批记录误判为失效）
@@ -1233,6 +1275,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     probeSeq[key] = seq;
     probeBusy[key] = true;
     renderStatus();
+    renderGrid(); // 探测在途：就地置灰删除按钮（否则本次 renderGrid 早于探测，按钮不会禁用）
     var startedAt = Date.now(); // 竞态基准：早于此刻确认过的记录，才允许被本次探测判为失效
     var data = null;
     try {
@@ -1251,7 +1294,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (probeSeq[key] !== seq) return; // 已切到别的目标或发起了更新的探测：丢弃本次结果
     probeBusy[key] = false;
     probeState[key] = { at: Date.now(), data: data };
-    if (data.ok) applyProbe(srv, data, startedAt);
+    if (data.ok) await applyProbe(srv, data, startedAt);
     else markProbeError(srv, data.error);
     renderStatus();
     renderGrid();
@@ -1284,8 +1327,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (!srv) return;
     var key = targetKey(srv);
     if (probeBusy[key]) { targetStatus.textContent = '检测中…'; return; }
-    var s = serverById(srv.id);
-    var st = s && s.status;
+    var st = serverStatus[srv.id];
     if (!st) { targetStatus.textContent = '未探测'; return; }
     if (!st.reachable) {
       targetStatus.textContent = '离线';
@@ -1375,11 +1417,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     formMsg.textContent = '';
   }
 
-  function removeServer(s) {
+  async function removeServer(s) {
     if (!window.confirm('确定删除服务器「' + (s.label || s.host) + '」的配置吗？（历史推送记录保留）')) return;
     var idx = servers.indexOf(s);
     if (idx >= 0) servers.splice(idx, 1);
-    saveJson(SERVERS_KEY, servers);
+    delete serverStatus[s.id]; // 旧探测状态作废
+    try { await deleteServerRemote(s.id); } catch (e) { persistFail(e); }
     resetForm();
     renderServerList();
     renderTargetSel(); // 若删的是当前选中项，选择会回退到本机
@@ -1387,7 +1430,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     hint('已删除服务器配置');
   }
 
-  serverForm.addEventListener('submit', function (e) {
+  serverForm.addEventListener('submit', async function (e) {
     e.preventDefault();
     var label = fLabel.value.trim();
     var host = fHost.value.trim();
@@ -1419,12 +1462,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       s.user = user;
       s.dir = dir;
       s.urlBase = urlBase;
-      delete s.status; // host/dir 可能已变：旧探测状态作废
+      delete serverStatus[s.id]; // 配置可能已变：旧探测状态作废
+      try {
+        await updateServerRemote(s.id, { label: label, host: host, user: user, dir: dir, urlBase: urlBase });
+      } catch (err) { persistFail(err); }
     } else {
       s = { id: genId(), label: label, host: host, user: user, dir: dir, urlBase: urlBase };
       servers.push(s);
+      try { await createServerRemote(s); } catch (err) { persistFail(err); }
     }
-    saveJson(SERVERS_KEY, servers);
     resetForm();
     renderServerList();
     renderTargetSel();
@@ -1493,7 +1539,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 上传成功写入历史：同 host+dir 的记录覆盖；本机目标固定 key='local'（host/dir 为空串）
-  function recordUpload(data, orig, srv) {
+  async function recordUpload(data, orig, srv) {
     var rec = {
       key: srv ? srv.id : 'local',
       label: srv ? (srv.label || srv.host) : '本机',
@@ -1521,7 +1567,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       }
     }
     if (!replaced) entry.targets.push(rec);
-    saveJson(HISTORY_KEY, history);
+    try { await saveHistoryEntry(data.localName); } catch (e) { persistFail(e); }
   }
 
   // 单文件上传：body 直接放 File 对象（浏览器按原始字节发送）
@@ -1544,7 +1590,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (!res.ok || !jsonOk || !data.ok) {
         throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
       }
-      recordUpload(data, name, srv);
+      await recordUpload(data, name, srv);
 
       // 成功态：方式徽标 + 路径（有 URL 再加一行）+ 各自的复制按钮
       entry.status.textContent = '';
@@ -1652,7 +1698,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 拉取本机图库 → 对账 → 渲染。
   // 关键：失败时直接返回（跳过对账与渲染）——若以空清单继续对账，
-  // 会把 localStorage 中的推送记录误当「本地文件已删除」而全部清空；
+  // 会把服务端保存的推送记录误当「本地文件已删除」而全部清空；
   // 成功但清单为空（文件确实都删了）才允许正常对账清理。
   async function refreshHistory() {
     var seq = ++historySeq;
@@ -1680,21 +1726,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var cur = currentServer();
     var cached = cur && probeState[targetKey(cur)];
     if (cur && cached && cached.data && cached.data.ok) {
-      reconcileWithRemote(cur, cached.data.files || [], cached.at);
+      await reconcileWithRemote(cur, cached.data.files || [], cached.at);
     }
-    reconcile();
+    await reconcile();
     renderGrid();
   }
 
-  // 对账：以服务端图库为准，本地文件已删除的清掉其历史记录
-  function reconcile() {
+  // 对账：以服务端图库为准，本地文件已删除的清掉其历史记录（批量落库）
+  async function reconcile() {
     var known = {};
     libFiles.forEach(function (f) { known[f.name] = true; });
-    var changed = false;
+    var deletes = [];
     Object.keys(history).forEach(function (k) {
-      if (!known[k]) { delete history[k]; changed = true; }
+      if (!known[k]) { delete history[k]; deletes.push(k); }
     });
-    if (changed) saveJson(HISTORY_KEY, history);
+    if (!deletes.length) return;
+    try { await batchHistory({ deletes: deletes }); } catch (e) { persistFail(e); }
   }
 
   // 卡片键追踪：由 reconcileCards 按「上一轮已存在的键」决定是否播入场动效。
@@ -2171,14 +2218,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 从本地 history 移除某目标记录；本地条目保留（仍可作本机预览）
-  function dropTargetRecord(name, srv) {
+  // 从服务端 history 移除某目标记录；本地条目保留（仍可作本机预览）
+  async function dropTargetRecord(name, srv) {
     var rec = history[name];
     if (!rec || !Array.isArray(rec.targets)) return;
     rec.targets = rec.targets.filter(function (t) {
       return !(t.host === srv.host && t.dir === srv.dir);
     });
-    saveJson(HISTORY_KEY, history);
+    try { await saveHistoryEntry(name); } catch (e) { persistFail(e); }
   }
 
   // 从 remoteIndex 缓存移除某文件名（删远端后保持缓存一致）
@@ -2309,7 +2356,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       window.alert('删除失败：' + (err.message || err));
       return;
     }
-    dropTargetRecord(name, srv);
+    await dropTargetRecord(name, srv);
     dropRemoteIndexFile(srv, remoteName);
     await leaveCardWithReflow(cardEl, container, scope); // 删除成功后出场 + 兄弟并行补位
     hint('已从 ' + (srv.label || srv.host) + ' 删除');
@@ -2350,7 +2397,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     delete history[name];
-    saveJson(HISTORY_KEY, history);
+    try { await deleteHistoryEntry(name); } catch (e) { persistFail(e); }
     await leaveCardWithReflow(cardEl, container, scope); // 删除成功后出场 + 兄弟并行补位
     hint('已删除');
     refreshHistory();
@@ -2392,7 +2439,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (!res.ok || !jsonOk || !data.ok) {
       throw new Error((data && data.error) || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
     }
-    recordUpload(data, origOf(name), srv);
+    await recordUpload(data, origOf(name), srv);
     return data;
   }
 
@@ -2808,7 +2855,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       okText: '清理',
     });
     if (!r.confirmed) return;
-    staleNames.forEach(function (k) { dropTargetRecord(k, srv); });
+    var upserts = {};
+    staleNames.forEach(function (k) {
+      var rec = history[k];
+      if (!rec || !Array.isArray(rec.targets)) return;
+      rec.targets = rec.targets.filter(function (t) {
+        return !(t.host === srv.host && t.dir === srv.dir);
+      });
+      upserts[k] = rec;
+    });
+    if (Object.keys(upserts).length) {
+      try { await batchHistory({ upserts: upserts }); } catch (e) { persistFail(e); }
+    }
     hint('已清理 ' + staleNames.length + ' 条失效记录');
     refreshHistory();
   }
@@ -2835,11 +2893,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var srv = currentServer();
     if (srv) probeTarget(srv, false);
   });
-  renderTargetSel();
-  refreshHistory();
-  // 页面加载：对上次记住的服务器目标探测一次
-  var initSrv = currentServer();
-  if (initSrv) probeTarget(initSrv, false);
+
+  // 启动：先从服务端拉取配置与历史，再渲染目标下拉与图库，最后探测上次目标。
+  // 配置/历史存服务端，故初始化是异步的；加载失败给出提示并停止渲染（避免用空数据误对账）。
+  async function boot() {
+    try {
+      await Promise.all([loadServers(), loadHistory()]);
+    } catch (e) {
+      hint('加载服务端配置失败：' + (e && e.message ? e.message : e), true);
+      return;
+    }
+    renderTargetSel();
+    await refreshHistory();
+    var initSrv = currentServer();
+    if (initSrv) probeTarget(initSrv, false);
+  }
+  boot();
 })();
 </script>
 </body>

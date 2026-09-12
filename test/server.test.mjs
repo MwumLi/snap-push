@@ -1360,6 +1360,25 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
   }
 
+  // 页面测试的 fetch 垫片外层：拦截服务端配置/历史接口，其余交给 baseShim。
+  // 配置/历史已改存服务端，测试不再通过 localStorage 预置，而是用 state 注入。
+  function withStateFetch(baseShim, state) {
+    return async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || 'GET';
+      if (u.includes('/api/servers') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ ok: true, servers: state.servers || [] }) };
+      }
+      if (u.includes('/api/history') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ ok: true, history: state.history || {} }) };
+      }
+      if (u.includes('/api/servers') || u.includes('/api/history')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      return baseShim(url, opts);
+    };
+  }
+
   // 定位卡片上的「删除」按钮（className=danger 且文本为「删除」）
   function findDeleteBtn(root) {
     return findNode(root, (n) => n.className === 'danger' && n.textContent === '删除');
@@ -1412,12 +1431,12 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const STALE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-stale.png';
 
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
     // STALE：有 history 记录但远端已无 → 应显示「远端已删」
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [STALE]: {
         orig: 'stale.png',
         targets: [{
@@ -1426,7 +1445,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', stale: true, time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       '127.0.0.1|/tmp/x': {
         fetchedAt: Date.now(),
@@ -1441,7 +1460,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       setItem(k, v) { store.set(k, String(v)); },
     };
     const windowShim = { confirm() { return true; }, alert() {} };
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       let body;
       if (u.includes('/api/library')) {
@@ -1455,7 +1474,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         body = { ok: true };
       }
       return { ok: true, status: 200, json: async () => body };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1527,11 +1546,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
     const LOCAL = `${HEX32}-local.png`;
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1540,7 +1559,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1551,7 +1570,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const windowShim = { confirm() { return true; }, alert() {} };
     let releaseRemote;
     const remoteGate = new Promise((r) => { releaseRemote = r; }); // 挂起探测，制造「图库先渲染、探测后渲染」
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       if (u.includes('/api/remote')) {
         await remoteGate;
@@ -1561,7 +1580,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1590,11 +1609,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const REMOTE_ONLY = 'ffffffffffffffffffffffffffffffff-remote.png';
     const REMOTE_ONLY_MD5 = 'ffffffffffffffffffffffffffffffff';
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1603,7 +1622,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1614,7 +1633,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const windowShim = { confirm() { return true; }, alert() {} };
     let releaseRemote;
     const remoteGate = new Promise((r) => { releaseRemote = r; });
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       if (u.includes('/api/remote')) {
         await remoteGate;
@@ -1627,7 +1646,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1658,11 +1677,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const LOCAL = `${HEX32}-local.png`;
     const KEY = '127.0.0.1|/tmp/x';
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1671,7 +1690,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
     }));
@@ -1684,7 +1703,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1699,7 +1718,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ ok: true, dirExists: true, hasRsync: true, files: deleteCalled ? [] : [{ name: LOCAL, md5: HEX32 }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1736,11 +1755,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const KEY = '127.0.0.1|/tmp/x';
 
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1749,7 +1768,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
     }));
@@ -1762,7 +1781,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1778,7 +1797,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         body = { ok: true };
       }
       return { ok: true, status: 200, json: async () => body };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1810,11 +1829,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
     const LOCAL = `${HEX32}-local.png`;
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1823,7 +1842,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1833,7 +1852,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1847,7 +1866,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return new Promise(() => {}); // 永不 resolve：让探测一直处于在途
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
