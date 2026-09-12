@@ -37,6 +37,8 @@ import {
   createJsonStore,
   validateServerFields,
   resolveConfigDir,
+  resolveSnapDir,
+  resolveCacheDir,
 } from '../src/server.js';
 
 const HEX32 = 'd41d8cd98f00b204e9800998ecf8427e'; // 合法的 32 位小写 hex 样例（md5("")）
@@ -161,8 +163,17 @@ describe('纯函数：validateDir', () => {
     assert.equal(validateDir('/data/images_v2.bak'), '/data/images_v2.bak');
   });
 
-  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠 / .. 穿越）', () => {
-    const badValues = ['tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/', '/tmp/../etc', '/../etc', '/a/../../b'];
+  test('家目录形式 ~/... 合法并归一化', () => {
+    assert.equal(validateDir('~/snap-push'), '~/snap-push');
+    assert.equal(validateDir('~/snap-push/'), '~/snap-push');
+    assert.equal(validateDir('~/a/b'), '~/a/b');
+  });
+
+  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠 / ~ 根 / .. 穿越）', () => {
+    const badValues = [
+      'tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/', '~',
+      '~snap-push', '~//', '~/../etc', '/tmp/../etc', '/../etc', '/a/../../b', '~/a/../b',
+    ];
     for (const bad of badValues) {
       assert.equal(validateDir(bad), null, `validateDir 应拒绝: ${JSON.stringify(bad)}`);
     }
@@ -239,6 +250,12 @@ describe('纯函数：buildRemoteListScript', () => {
       '  echo ::DIR_MISSING::;',
       'fi',
     ].join('\n'));
+  });
+
+  test('家目录形式 ~/snap-push 展开为 "$HOME/snap-push"（远端 shell 展开）', () => {
+    const script = buildRemoteListScript('~/snap-push');
+    assert.ok(script.includes('if [ -d "$HOME/snap-push" ]; then'));
+    assert.ok(script.includes('ls -1 "$HOME/snap-push" 2>/dev/null;'));
   });
 });
 
@@ -359,6 +376,14 @@ describe('纯函数：buildProbeScript（妙传探测脚本）', () => {
   test('名字不符合 <md5>- 约定时条件退化为 false：强制 MISSING（宁可重传不跳过）', () => {
     const script = buildProbeScript('foo.png', '/tmp/d');
     assert.equal(script, `mkdir -p '/tmp/d'; if false; then echo EXISTS; else echo MISSING; fi`);
+  });
+
+  test('家目录形式 ~/d 用 "$HOME/d" 展开，且文件名并入同一表达式', () => {
+    const script = buildProbeScript(`${HEX32}-x.png`, '~/d');
+    assert.equal(
+      script,
+      `mkdir -p "$HOME/d"; if test -f "$HOME/d/${HEX32}-x.png" && md5sum "$HOME/d/${HEX32}-x.png" 2>/dev/null | grep -q '^${HEX32}'; then echo EXISTS; else echo MISSING; fi`,
+    );
   });
 });
 
@@ -549,10 +574,12 @@ describe('GET / DELETE /api/remote-file（远端缩略图）', () => {
   let server;
   let base;
   let snapDir;
+  let cacheDir;
 
   before(async () => {
     snapDir = path.join(tmpRoot, 'remote-file');
-    ({ server, base } = await startServer({ snapDir }));
+    cacheDir = path.join(tmpRoot, 'remote-file-cache');
+    ({ server, base } = await startServer({ snapDir, cacheDir }));
   });
 
   after(async () => {
@@ -565,7 +592,6 @@ describe('GET / DELETE /api/remote-file（远端缩略图）', () => {
     const name = `${HEX32}-cached.png`;
     // 复现服务端的缓存键：sha1(host|dir) 前 12 位 + '-' + 文件名
     const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
-    const cacheDir = path.join(snapDir, '.remote-cache');
     fs.mkdirSync(cacheDir, { recursive: true });
     fs.writeFileSync(path.join(cacheDir, `${key}-${name}`), Buffer.from([1, 2, 3, 4]));
 
@@ -1024,6 +1050,30 @@ describe('createJsonStore（服务端 JSON 存储）', () => {
     assert.equal(resolveConfigDir({}), '/tmp/y');
     if (old === undefined) delete process.env.SNAP_PUSH_CONFIG_DIR;
     else process.env.SNAP_PUSH_CONFIG_DIR = old;
+  });
+
+  test('resolveSnapDir 默认 ~/snap-push 与显式注入/环境变量', () => {
+    const old = process.env.SNAP_PUSH_DIR;
+    delete process.env.SNAP_PUSH_DIR;
+    assert.equal(resolveSnapDir({}), path.join(os.homedir(), 'snap-push'));
+    assert.equal(resolveSnapDir({ snapDir: '/tmp/x' }), '/tmp/x');
+    process.env.SNAP_PUSH_DIR = '/tmp/y';
+    assert.equal(resolveSnapDir({}), '/tmp/y');
+    if (old === undefined) delete process.env.SNAP_PUSH_DIR;
+    else process.env.SNAP_PUSH_DIR = old;
+  });
+
+  test('resolveCacheDir 默认系统临时目录且按 uid 隔离，支持覆盖', () => {
+    const old = process.env.SNAP_PUSH_CACHE_DIR;
+    delete process.env.SNAP_PUSH_CACHE_DIR;
+    const def = resolveCacheDir({});
+    assert.ok(def.startsWith(os.tmpdir()), `应在临时目录下：${def}`);
+    assert.ok(def.includes('snap-push-cache'), `应含应用名：${def}`);
+    assert.equal(resolveCacheDir({ cacheDir: '/tmp/c' }), '/tmp/c');
+    process.env.SNAP_PUSH_CACHE_DIR = '/tmp/d';
+    assert.equal(resolveCacheDir({}), '/tmp/d');
+    if (old === undefined) delete process.env.SNAP_PUSH_CACHE_DIR;
+    else process.env.SNAP_PUSH_CACHE_DIR = old;
   });
 });
 

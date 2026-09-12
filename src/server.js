@@ -21,7 +21,11 @@ import { pathToFileURL } from 'node:url';
 // =====================================================================
 const DEFAULT_HOST = '127.0.0.1';            // 仅监听本机回环，避免暴露到网络
 const DEFAULT_PORT = 8123;
-const DEFAULT_SNAP_DIR = '/tmp/snap-push';   // 本机图片落盘目录
+// 本机图片落盘目录：放家目录持久保存，避免 /tmp 重启被清空导致图库与历史一起丢
+const DEFAULT_SNAP_DIR = () => path.join(os.homedir(), 'snap-push');
+// 远端缩略图缓存目录：放系统临时目录（可随时丢失、由系统清理），按 uid 隔离避免多用户权限冲突
+const DEFAULT_CACHE_DIR = () =>
+  path.join(os.tmpdir(), `snap-push-cache-${typeof process.getuid === 'function' ? process.getuid() : 'u'}`);
 const MAX_BODY_BYTES = 20 * 1024 * 1024;     // 上传体积上限：20MB
 const MAX_JSON_BODY = 4 * 1024 * 1024;       // 配置/历史 JSON 请求体上限：4MB
 const SUBPROCESS_TIMEOUT_MS = 30_000;        // ssh/rsync/scp 单次执行超时
@@ -71,17 +75,54 @@ export const validateHost = validateWord;
 export const validateUser = validateWord;
 
 /**
- * 校验远端目录：必须以 / 开头，且仅包含 [A-Za-z0-9._/-]；去掉尾部斜杠统一格式。
- * 非法（相对路径 / 空值 / 特殊字符 / 仅一个 /）返回 null。
+ * 校验远端目录：绝对路径（`/...`）或家目录形式（`~/...`）。
+ * - `~` 仅允许出现在开头；裸 `~`（家目录根本身）拒绝，避免直接写满家目录；
+ * - 路径部分仅允许 [A-Za-z0-9._/-]，去掉尾部斜杠统一格式；
+ * - 拒绝任何 `..` 路径段：/tmp/../etc 这类目录会把远端读/删能力放大到父目录。
+ * 非法返回 null，合法返回归一化后的路径（如 `/tmp/snap-push`、`~/snap-push`）。
  */
 export function validateDir(v) {
-  if (typeof v !== 'string' || !v.startsWith('/')) return null;
-  if (!/^[A-Za-z0-9._/-]+$/.test(v)) return null;
-  const trimmed = v.replace(/\/+$/, '');
-  if (trimmed.length === 0) return null;
-  // 拒绝 .. 路径段：/tmp/../etc 这类目录会把远端读/删能力放大到父目录
-  if (trimmed.split('/').some((seg) => seg === '..')) return null;
+  if (typeof v !== 'string') return null;
+  let rest; // 去掉前导 ~ 后的剩余部分：'' 或 '/...'
+  let home = false;
+  if (v === '~') {
+    return null; // 不允许把家目录根当目标
+  } else if (v.startsWith('~/')) {
+    home = true;
+    rest = v.slice(1); // '/...'
+  } else if (v.startsWith('/')) {
+    rest = v;
+  } else {
+    return null;
+  }
+  // 字符白名单：~ 只允许在开头，故 rest 中不含 ~；拒绝空格/引号/分号/反引号等
+  if (rest !== '' && !/^\/[A-Za-z0-9._/-]*$/.test(rest)) return null;
+  const trimmed = ((home ? '~' : '') + rest).replace(/\/+$/, '');
+  if (trimmed === '' || trimmed === '/' || trimmed === '~') return null;
+  // 拒绝 .. 路径段：/tmp/../etc 或 ~/../etc
+  if (trimmed.replace(/^~\//, '').split('/').some((seg) => seg === '..')) return null;
   return trimmed;
+}
+
+/**
+ * 把已过 validateDir 的远端目录转成远端 shell 里安全的表达式：
+ * - 绝对路径 → 单引号 `'/tmp/x'`（无展开，现状不变）；
+ * - `~/x` → `"$HOME/x"`（远端 shell 展开家目录；x 已过白名单，不含 $/反引号/引号，双引号安全）。
+ */
+function remoteShellDir(dir) {
+  if (dir === '~') return '"$HOME"';
+  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}"`;
+  return `'${dir}'`;
+}
+
+/**
+ * 远端目录下某文件的 shell 表达式：
+ * - 绝对路径 → 单引号整体 `'/tmp/x/a.png'`（与改造前输出一致）；
+ * - `~/x` → `"$HOME/x/a.png"`（远端 shell 展开家目录；x/name 已过白名单，无 $/反引号/引号）。
+ */
+function remoteShellFile(dir, name) {
+  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}/${name}"`;
+  return `'${dir}/${name}'`;
 }
 
 /**
@@ -126,14 +167,15 @@ export function validateRemoteFileName(name) {
  *   1) 目录不存在/不可读 → 只输出 __DIR_MISSING__，前端按“远端为空”处理；
  *   2) 用 command -v 检测远端是否装了 rsync（决定 pull 走 rsync 还是 scp）；
  *   3) ls -1 列出目录内文件名，交给 parseRemoteList 过滤解析。
- * dir 进入本函数前已过 validateDir 白名单，嵌入单引号是安全的。
+ * dir 进入本函数前已过 validateDir 白名单，由 remoteShellDir 安全嵌入远端命令。
  */
 export function buildRemoteListScript(dir) {
+  const d = remoteShellDir(dir);
   return [
-    `if [ -d '${dir}' ]; then`,
+    `if [ -d ${d} ]; then`,
     '  echo ::DIR_OK::;',
     '  command -v rsync >/dev/null 2>&1 && echo ::RSYNC_OK:: || echo ::RSYNC_NO::;',
-    `  ls -1 '${dir}' 2>/dev/null;`,
+    `  ls -1 ${d} 2>/dev/null;`,
     'else',
     '  echo ::DIR_MISSING::;',
     'fi',
@@ -197,6 +239,16 @@ const DEFAULT_CONFIG_DIR = () =>
 // 目录内保存 instance-id（身份）、servers.json（服务器配置）、history.json（同步记录）。
 export function resolveConfigDir(opts = {}) {
   return opts.configDir || process.env.SNAP_PUSH_CONFIG_DIR || DEFAULT_CONFIG_DIR();
+}
+
+// 本机图片落盘目录：SNAP_PUSH_DIR 或 ~/snap-push（持久化，避免 /tmp 重启清空）
+export function resolveSnapDir(opts = {}) {
+  return opts.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR();
+}
+
+// 远端缩略图缓存目录：SNAP_PUSH_CACHE_DIR 或系统临时目录（可随时丢弃、由系统清理）
+export function resolveCacheDir(opts = {}) {
+  return opts.cacheDir || process.env.SNAP_PUSH_CACHE_DIR || DEFAULT_CACHE_DIR();
 }
 
 // 默认路径身份 secret 的进程内缓存：避免每次请求都读一次文件
@@ -415,15 +467,15 @@ async function scpFallback(localPath, name, target) {
  *      安全默认：宁可重传也不跳过（rsync -a 增量下重传代价可忽略）。
  * 名字不符合 <md5>- 约定时（正常流程不会发生）条件退化为 false：强制 MISSING。
  * 安全说明：name/dir 进入本函数前均已通过白名单校验，期望 md5 为纯 hex，
- *           嵌入远端命令串没有注入面。
+ *           由 remoteShellDir/remoteShellFile 安全嵌入远端命令，没有注入面。
  */
 export function buildProbeScript(name, dir) {
   const expectedMd5 = /^[0-9a-f]{32}/.exec(name)?.[0];
-  const remoteFile = `${dir}/${name}`;
+  const remoteFile = remoteShellFile(dir, name);
   const existsCheck = expectedMd5
-    ? `test -f '${remoteFile}' && md5sum '${remoteFile}' 2>/dev/null | grep -q '^${expectedMd5}'`
+    ? `test -f ${remoteFile} && md5sum ${remoteFile} 2>/dev/null | grep -q '^${expectedMd5}'`
     : 'false';
-  return `mkdir -p '${dir}'; if ${existsCheck}; then echo EXISTS; else echo MISSING; fi`;
+  return `mkdir -p ${remoteShellDir(dir)}; if ${existsCheck}; then echo EXISTS; else echo MISSING; fi`;
 }
 
 /**
@@ -755,7 +807,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       <span class="field"><label for="fLabel">昵称（可选）</label><input id="fLabel" placeholder="如：测试机"></span>
       <span class="field"><label for="fHost">IP / 主机名（必填）</label><input id="fHost" required placeholder="如 192.168.1.10"></span>
       <span class="field"><label for="fUser">用户名</label><input id="fUser" placeholder="默认 root"></span>
-      <span class="field"><label for="fDir">远端目录</label><input id="fDir" placeholder="默认 /tmp/snap-push"></span>
+      <span class="field"><label for="fDir">远端目录</label><input id="fDir" placeholder="默认 ~/snap-push"></span>
       <span class="field"><label for="fUrlBase">静态 URL 前缀（可选）</label><input id="fUrlBase" placeholder="如 https://cdn.example.com/snap"></span>
       <div>
         <button type="submit">保存</button>
@@ -1353,12 +1405,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return 's' + Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
   }
 
-  // 目录校验（与服务端白名单一致）：以 / 开头、字符白名单、去尾部斜杠；'/' 本身非法
+  // 目录校验（与服务端 validateDir 一致）：绝对路径 /... 或家目录 ~/...、
+  // 字符白名单、去尾部斜杠；拒绝裸 ~、裸 / 与任何 .. 路径段。
+  // 注意：页面 JS 位于外层模板字符串内，禁用反斜杠，故正则不写转义斜杠。
   function validDir(v) {
-    if (v.charAt(0) !== '/') return null;
-    var d = stripTrailingSlash(v);
-    if (d === '' || d === '/') return null;
-    if (!/^[A-Za-z0-9._/-]+$/.test(d)) return null;
+    var home = false;
+    var rest;
+    if (v === '~') return null;
+    if (v.charAt(0) === '~' && v.charAt(1) === '/') { home = true; rest = v.slice(1); }
+    else if (v.charAt(0) === '/') { rest = v; }
+    else return null;
+    if (rest !== '' && !/^[A-Za-z0-9._/-]*$/.test(rest)) return null;
+    var d = stripTrailingSlash((home ? '~' : '') + rest);
+    if (d === '' || d === '/' || d === '~') return null;
+    var body = (d.indexOf('~/') === 0) ? d.slice(2) : d;
+    var segs = body.split('/');
+    for (var i = 0; i < segs.length; i++) { if (segs[i] === '..') return null; }
     return d;
   }
 
@@ -1435,7 +1497,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var label = fLabel.value.trim();
     var host = fHost.value.trim();
     var user = fUser.value.trim() || 'root';       // 用户名缺省 root
-    var dirRaw = fDir.value.trim() || '/tmp/snap-push'; // 目录缺省 /tmp/snap-push
+    var dirRaw = fDir.value.trim() || '~/snap-push'; // 目录缺省 ~/snap-push（远端用户家目录下）
     var urlBase = stripTrailingSlash(fUrlBase.value.trim()); // 去尾斜杠避免拼出双斜杠
 
     // 客户端预校验（与服务端白名单一致）：尽早给出中文提示，避免提交后才报错
@@ -1446,7 +1508,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     var dir = validDir(dirRaw);
     if (!dir) {
-      formMsg.textContent = '远端目录不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠';
+      formMsg.textContent = '远端目录不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）';
       return;
     }
     if (urlBase && urlBase.indexOf('http://') !== 0 && urlBase.indexOf('https://') !== 0) {
@@ -3016,7 +3078,7 @@ async function handleUpload(req, res, params, ctx) {
     const dir = validateDir(dirRaw);
     if (!dir) {
       req.resume();
-      return sendJson(res, 400, { ok: false, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' });
+      return sendJson(res, 400, { ok: false, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' });
     }
     target = { host: validHost, user, dir };
   }
@@ -3086,7 +3148,7 @@ function parseTargetParams(params) {
   }
   const dir = validateDir(dirRaw);
   if (!dir) {
-    return { ok: false, status: 400, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' };
+    return { ok: false, status: 400, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' };
   }
   return { ok: true, target: { host, user, dir }, urlBase: params.get('urlBase') || '' };
 }
@@ -3180,17 +3242,17 @@ async function findLocalByMd5(snapDir, md5) {
  * 不同目标下同名文件（尤其是不带 md5 前缀的手工文件）内容可能不同，
  * 只用文件名做键会互相覆盖、串图，因此把目标身份也纳入键。
  */
-function remoteCachePath(snapDir, host, dir, name) {
+function remoteCachePath(cacheDir, host, dir, name) {
   const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
-  return path.join(snapDir, '.remote-cache', `${key}-${name}`);
+  return path.join(cacheDir, `${key}-${name}`);
 }
 
 /**
  * GET /api/remote-file?host=&user=&dir=&name=
  * 按需从远端读取单个文件字节（缩略图/预览）：
- *   1) 命中本地缓存 .remote-cache/<name> → 直接回放；
+ *   1) 命中缓存目录（SNAP_PUSH_CACHE_DIR，默认系统临时目录）→ 直接回放；
  *   2) 未命中 → ssh cat 取回 → 原子写入缓存 → 回给浏览器。
- * 缓存目录以点号开头，readdir 时不会被 isValidStoredName 收录进图库。
+ * 缓存属可丢弃数据，放临时目录、由系统清理；键含 host|dir 短 hash 防串图。
  */
 async function handleRemoteFile(req, res, params, ctx) {
   req.resume(); // 无请求体
@@ -3200,8 +3262,8 @@ async function handleRemoteFile(req, res, params, ctx) {
   if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
   const { host, user, dir } = pt.target;
 
-  const cacheDir = path.join(ctx.snapDir, '.remote-cache');
-  const cachePath = remoteCachePath(ctx.snapDir, host, dir, name);
+  const cacheDir = ctx.cacheDir;
+  const cachePath = remoteCachePath(cacheDir, host, dir, name);
   try {
     const stat = await fs.promises.stat(cachePath);
     if (stat.isFile()) return sendFile(res, cachePath, name); // 缓存命中
@@ -3211,7 +3273,7 @@ async function handleRemoteFile(req, res, params, ctx) {
 
   let r;
   try {
-    r = await runBuffer('ssh', [...SSH_ARGS, `${user}@${host}`, `cat '${dir}/${name}'`]);
+    r = await runBuffer('ssh', [...SSH_ARGS, `${user}@${host}`, `cat ${remoteShellFile(dir, name)}`]);
   } catch (err) {
     return sendJson(res, 502, { ok: false, error: err.message || '读取远端文件失败' });
   }
@@ -3250,7 +3312,7 @@ async function handleRemoteDelete(req, res, params, ctx) {
 
   let r;
   try {
-    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, `rm -f '${dir}/${name}'`]);
+    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, `rm -f ${remoteShellFile(dir, name)}`]);
   } catch (err) {
     return sendJson(res, 502, { ok: false, error: err.message || '删除远端文件失败' });
   }
@@ -3260,8 +3322,8 @@ async function handleRemoteDelete(req, res, params, ctx) {
       error: `删除远端文件失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`,
     });
   }
-  // 顺带清掉本地缓存，避免删后仍能命中旧图
-  await fs.promises.rm(remoteCachePath(ctx.snapDir, host, dir, name), { force: true }).catch(() => {});
+  // 顺带清掉缓存，避免删后仍能命中旧图
+  await fs.promises.rm(remoteCachePath(ctx.cacheDir, host, dir, name), { force: true }).catch(() => {});
   return sendJson(res, 200, { ok: true });
 }
 
@@ -3391,7 +3453,7 @@ export function validateServerFields(input, partial = false) {
   }
   if (!partial || has('dir')) {
     if (validateDir(input.dir) === null) {
-      return { ok: false, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' };
+      return { ok: false, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' };
     }
   }
   if (has('urlBase') && input.urlBase) {
@@ -3592,16 +3654,19 @@ async function route(req, res, ctx) {
 /**
  * 创建 snap-push HTTP 服务（只创建不监听，便于测试注入目录与端口）。
  * @param {object} [options]
- * @param {string} [options.snapDir] 本机落盘目录，默认取环境变量 SNAP_PUSH_DIR 或 /tmp/snap-push
+ * @param {string} [options.snapDir] 本机图片落盘目录，默认取环境变量 SNAP_PUSH_DIR 或 ~/snap-push
  * @param {string} [options.configDir] app 配置与数据目录，默认 SNAP_PUSH_CONFIG_DIR 或 ~/.config/snap-push
+ * @param {string} [options.cacheDir] 远端缩略图缓存目录，默认 SNAP_PUSH_CACHE_DIR 或系统临时目录
  * @param {number} [options.maxBody] 上传体积上限（字节），默认 20MB
  * @returns {import('node:http').Server}
  */
 export function createServer(options = {}) {
-  const snapDir = options.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR;
+  const snapDir = resolveSnapDir(options);
   const maxBody = options.maxBody || MAX_BODY_BYTES;
   // app 配置与数据目录：servers.json（服务器配置）/ history.json（同步记录）
   const configDir = resolveConfigDir(options);
+  // 远端缩略图缓存目录：可丢弃数据，默认放系统临时目录
+  const cacheDir = resolveCacheDir(options);
   // 实例身份在服务创建时计算一次（可注入 secret/secretFile 便于测试与固定复现）
   const svcId = computeServiceId(options);
 
@@ -3619,6 +3684,7 @@ export function createServer(options = {}) {
     enqueue,
     svcId,
     configDir,
+    cacheDir,
     serversStore: createJsonStore(path.join(configDir, 'servers.json'), []),
     historyStore: createJsonStore(path.join(configDir, 'history.json'), {}),
   };
@@ -3644,7 +3710,8 @@ export function start() {
   const server = createServer();
   server.listen(port, host, () => {
     console.log(`snap-push 已启动：http://${host}:${port}`);
-    console.log(`本机图片目录：${process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR}`);
+    console.log(`本机图片目录：${resolveSnapDir()}`);
+    console.log(`配置/数据目录：${resolveConfigDir()}`);
   });
   return server;
 }
