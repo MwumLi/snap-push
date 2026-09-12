@@ -1581,6 +1581,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   function showHistoryError(message) {
     historyCount.textContent = '';
     grid.textContent = '';
+    prevCards.grid = []; // 卡片已被清空，键集同步重置，避免下次对账复用已脱离文档的元素
     var p = document.createElement('p');
     p.className = 'empty';
     p.textContent = '历史加载失败：' + message + '（本地记录未动，可刷新重试）';
@@ -1638,23 +1639,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (changed) saveJson(HISTORY_KEY, history);
   }
 
-  // 卡片新增动效的键追踪：每个容器记录各卡片「首次出现时间」。
-  // 只有最近新出现（窗口内）的卡片才带入场动效，避免每次刷新（探测/同步/切换目标）全部卡片一起动。
-  // 用时间窗而非「与上一轮比较」：探测与图库拉取几乎同时返回时会连续 renderGrid，
-  // 若按上一轮比较，第二次重建会判定「非新」而把动画类丢掉，导致动画被截断。
-  // scope 为容器标识（'grid' / 'sync'），keys 为本轮全部卡片键；返回 isNew(key)。
-  var ENTER_WINDOW_MS = 800; // 卡片出现后保持入场动效的时间窗
-  var renderedKeys = { grid: {}, sync: {} };
-  function markNewCards(scope, keys) {
-    var prev = renderedKeys[scope] || {};
-    var now = Date.now();
-    var next = {};
-    keys.forEach(function (k) { next[k] = prev[k] || now; }); // 老键保留首次出现时间，新键记当前
-    renderedKeys[scope] = next;
-    return function (key) {
-      return next[key] != null && (now - next[key]) < ENTER_WINDOW_MS;
-    };
-  }
+  // 卡片键追踪：由 reconcileCards 按「上一轮已存在的键」决定是否播入场动效。
+  // 已显示的卡片复用原 DOM 元素、不重新挂载，因此探测/图库刷新触发的二次渲染不会重放动画。
 
   // 交错入场延迟：按卡片序号递增、封顶，避免长列表末尾等待过久
   function enterDelay(index) { return Math.min(index * 50, 300); }
@@ -1707,6 +1693,76 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     });
   }
 
+  // 卡片键对账渲染：按 key 复用已存在的 DOM 元素，只增/删/移动差异项。
+  //   - sig 相同 → 复用原元素（不重新挂载，入场动画不重放，缩略图不重载）；
+  //   - sig 变化 → 重建该卡片元素（内容已变，不播入场动画）；
+  //   - 新 key   → 新建元素并播入场动画。
+  // entries 为期望顺序的 [{ key, sig, build(isNew) -> el }]。
+  // 正在出场（_leaving）的旧元素本轮不删除，避免打断删除动画。
+  function reconcileCards(container, scope, entries) {
+    var prevList = prevCards[scope] || [];
+    var prevMap = {};
+    prevList.forEach(function (c) { if (c && c.el) prevMap[c.key] = c; });
+    var first = measureCards(prevList); // 变更前位置，供 FLIP 补位
+
+    var next = [];
+    entries.forEach(function (e, i) {
+      var prev = prevMap[e.key];
+      var isNew = !prev;
+      var el;
+      if (prev && prev.sig === e.sig) {
+        el = prev.el; // 内容未变：复用，不重新挂载
+      } else {
+        el = e.build(isNew); // 新卡片或内容变化：重建
+        if (isNew && el.style) el.style.animationDelay = enterDelay(i) + 'ms';
+      }
+      var ref = (container.childNodes && container.childNodes[i]) || null;
+      if (ref !== el) container.insertBefore(el, ref);
+      next.push({ key: e.key, el: el, sig: e.sig, isNew: isNew });
+    });
+
+    // 移除本轮不再需要的节点（跳过正在播出场动画的元素）
+    // 注意：不能用对象做元素集合（对象键会被转成 "[object Object]" 而全部命中），改用数组
+    var keep = [];
+    next.forEach(function (c) { keep.push(c.el); });
+    var kids = container.childNodes ? Array.prototype.slice.call(container.childNodes) : [];
+    kids.forEach(function (node) {
+      if (keep.indexOf(node) >= 0 || (node && node._leaving)) return;
+      container.removeChild(node);
+    });
+
+    playFlip(next, first, 280); // 其余卡片平滑滑到新位置
+    prevCards[scope] = next;
+  }
+
+  // 图库本地卡片的内容签名：任一展示字段变化即重建该卡（无入场动画）
+  function localCardSig(f, srv) {
+    var rec = history[f.name];
+    var records = (rec && Array.isArray(rec.targets))
+      ? rec.targets.filter(function (x) { return !srv || (x.host === srv.host && x.dir === srv.dir); })
+        .map(function (x) {
+          return [x.label, x.host, x.dir, x.remoteName, x.remotePath, x.url,
+            x.method, x.stale ? 1 : 0, x.time].join('~');
+        }).join('|')
+      : '';
+    return ['L', f.name, f.size, f.mtime, nameOnTarget(f.name, srv),
+      srv ? (srv.label || srv.host) : '', records].join('\u0001');
+  }
+
+  // 远端独有卡片的内容签名
+  function remoteCardSig(item, srv) {
+    return ['R', item.name, item.md5 || '', srv.label || srv.host, srv.dir].join('\u0001');
+  }
+
+  // 同步抽屉条目的内容签名（来源 / 目标 / 勾选 / 忙碌状态 / 本地副本变化都会触发重建）
+  function syncCardSig(item, srcSrv, target) {
+    return ['S', syncSourceSel.value, item.name, item.md5 || '', item.local ? 1 : 0,
+      item.size, item.mtime, target ? (target.label || target.host) : '',
+      syncSelected[item.name] ? 1 : 0, syncBusy ? 1 : 0,
+      srcSrv ? (srcSrv.host + '|' + srcSrv.dir) : '',
+      item.md5 ? (localNameByMd5(item.md5) || '') : ''].join('\u0001');
+  }
+
   // 图库 = 当前目标下的全部图片：
   //   本机   → 全部本地图；
   //   服务器 → 该目标上存在的本地图（history ∪ remoteIndex）+ 远端独有（本地无副本）。
@@ -1744,43 +1800,43 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       ? total + ' 张 · ' + (srv.label || srv.host)
       : total + ' 张';
 
-    // 记录本轮卡片键：仅新出现的卡片加入场动效；空列表同样重置键集
-    var gridKeys = [];
-    locals.forEach(function (f) { gridKeys.push('L:' + f.name); });
-    remotes.forEach(function (f) { gridKeys.push('R:' + f.name); });
-    var gridIsNew = markNewCards('grid', gridKeys);
-
-    var first = measureCards(prevCards.grid); // 清空前量「变更前」位置，供 FLIP 补位
-    grid.textContent = ''; // 清空重建（textContent 赋值不产生 XSS 面）
+    // 组装期望卡片：本地在前、远端独有在后；空列表用占位节点参与对账
+    var entries = [];
+    locals.forEach(function (f) {
+      entries.push({
+        key: 'L:' + f.name,
+        sig: localCardSig(f, srv),
+        build: function (isNew) { return makeCard(f, srv, isNew); },
+      });
+    });
+    remotes.forEach(function (f) {
+      entries.push({
+        key: 'R:' + f.name,
+        sig: remoteCardSig(f, srv),
+        build: function (isNew) { return makeRemoteCard(f, srv, isNew); },
+      });
+    });
     if (!total) {
-      prevCards.grid = [];
-      var empty = document.createElement('p');
-      empty.className = 'empty';
-      empty.textContent = srv
+      var emptyText = srv
         ? '该目标下还没有图片：选择图片上传即会推送到 ' + (srv.label || srv.host)
         : '还没有图片：粘贴截图 / 拖拽 / 选择文件上传';
-      grid.appendChild(empty);
-      return;
+      entries.push({
+        key: '@empty',
+        sig: 'empty:' + emptyText,
+        build: function () {
+          var p = document.createElement('p');
+          p.className = 'empty';
+          p.textContent = emptyText;
+          return p;
+        },
+      });
     }
-    var gridCards = [];
-    locals.forEach(function (f, i) {
-      var key = 'L:' + f.name;
-      var isNew = gridIsNew(key);
-      var card = makeCard(f, srv, isNew);
-      if (isNew) card.style.animationDelay = enterDelay(i) + 'ms'; // 多张新图逐张浮现
-      grid.appendChild(card);
-      gridCards.push({ key: key, el: card, isNew: isNew });
+    reconcileCards(grid, 'grid', entries);
+    // 探测在途状态不参与签名（否则每次探测起止都重建卡片）：就地刷新删除按钮置灰
+    var busy = !!(srv && probeBusy[targetKey(srv)]);
+    (prevCards.grid || []).forEach(function (c) {
+      if (c.el && c.el._delBtn) c.el._delBtn.disabled = busy;
     });
-    remotes.forEach(function (f, i) {
-      var key = 'R:' + f.name;
-      var isNew = gridIsNew(key);
-      var card = makeRemoteCard(f, srv, isNew);
-      if (isNew) card.style.animationDelay = enterDelay(locals.length + i) + 'ms';
-      grid.appendChild(card);
-      gridCards.push({ key: key, el: card, isNew: isNew });
-    });
-    playFlip(gridCards, first, 280); // 其余卡片平滑滑到新位置
-    prevCards.grid = gridCards;
   }
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
@@ -1846,6 +1902,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.textContent = '删除';
     del.disabled = !!(srv && probeBusy[targetKey(srv)]); // 探测在途时置灰，避免用旧快照删除
     del.addEventListener('click', function () { removeFile(f.name, srv, card, grid, 'grid'); });
+    card._delBtn = del; // 复用卡片时就地刷新置灰状态
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -1917,6 +1974,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     del.textContent = '删除';
     del.disabled = !!probeBusy[targetKey(srv)]; // 探测在途时置灰，避免用旧快照删除
     del.addEventListener('click', function () { removeRemoteOnly(item, srv, card, grid, 'grid'); });
+    card._delBtn = del; // 复用卡片时就地刷新置灰状态
     ops.appendChild(del);
     body.appendChild(ops);
 
@@ -2128,12 +2186,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 删除出场动效（Vue 列表过渡的 leave-active + move 思路）：
   // 离开卡片加 .card-leave 并脱离文档流（position:absolute 钉在原位），兄弟卡片立即让位，
-  // 同时并行 FLIP 平滑补位；动画播完再由 refreshHistory 重建移除。
+  // 同时并行 FLIP 平滑补位；动画播完由后续 refreshHistory 的对账移除（_leaving 期间并发对账跳过）。
   // 仅在网络删除成功后调用，确保不会出现「卡片已消失但实际没删掉」。
   // 垫片 / 无测量能力 / 减少动态效果时退化为「只加 card-leave 并等待」。
   var LEAVE_MS = 320; // 与 CSS .card-leave 动画时长（旋转滑出 + 缩小淡出）保持一致
   function leaveCardWithReflow(el, container, scope) {
     return new Promise(function (resolve) {
+      if (el) el._leaving = true; // 标记出场中：并发对账不得移除该元素，避免打断动画
       var hasClass = el && typeof el.className === 'string';
       var canReflow = hasClass && !reduceMotion() &&
         typeof el.getBoundingClientRect === 'function' &&
@@ -2161,7 +2220,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         el.style.zIndex = '2';
         playFlip(siblings, first, Math.max(0, LEAVE_MS - 20));
       }
-      setTimeout(resolve, reduceMotion() ? 0 : LEAVE_MS);
+      setTimeout(function () {
+        if (el) el._leaving = false; // 动画结束：交回对账流程移除
+        resolve();
+      }, reduceMotion() ? 0 : LEAVE_MS);
     });
   }
 
@@ -2514,6 +2576,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       else delete syncSelected[item.name];
       updateSyncSelBtn();
     });
+    card._check = check; // 复用卡片时就地刷新勾选可用性
     lab.appendChild(check);
     lab.appendChild(document.createTextNode('选择'));
     ops.appendChild(lab);
@@ -2534,6 +2597,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       delBtn.textContent = '删除';
       delBtn.disabled = !!probeBusy[targetKey(srcSrv)]; // 探测在途时置灰，避免用旧快照删除
       delBtn.addEventListener('click', function () { removeRemoteOnly(item, srcSrv, card, syncList, 'sync'); });
+      card._delBtn = delBtn; // 复用卡片时就地刷新置灰状态
       ops.appendChild(delBtn);
     }
     body.appendChild(ops);
@@ -2551,55 +2615,66 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var srcLabel = srcSrv ? (srcSrv.label || srcSrv.host) : '本地图库';
     var tgtLabel = target ? (target.label || target.host) : '本机';
     syncTitle.textContent = srcLabel + ' → ' + tgtLabel;
-    var first = measureCards(prevCards.sync); // 清空前量「变更前」位置，供 FLIP 补位
-    syncList.textContent = '';
-
     var missing = missingItems();
+    var entries = [];
+    var srcBusy = !!(srcSrv && probeBusy[targetKey(srcSrv)]);
+
     if (missing === null) {
-      markNewCards('sync', []); // 清单不可用：重置键集，下次出现时重新播入场动效
-      prevCards.sync = [];
       // 来源服务器还没探测：给一个手动探测入口
-      var tip = document.createElement('p');
-      tip.className = 'sync-empty';
-      tip.textContent = '尚未获取「' + srcLabel + '」的清单';
-      var probeBtn = document.createElement('button');
-      probeBtn.type = 'button';
-      probeBtn.textContent = '探测';
-      probeBtn.addEventListener('click', function () { probeTarget(srcSrv, true); });
-      tip.appendChild(document.createElement('br'));
-      tip.appendChild(probeBtn);
-      syncList.appendChild(tip);
+      entries.push({
+        key: '@sync-probe',
+        sig: 'probe:' + srcLabel,
+        build: function () {
+          var tip = document.createElement('p');
+          tip.className = 'sync-empty';
+          tip.textContent = '尚未获取「' + srcLabel + '」的清单';
+          var probeBtn = document.createElement('button');
+          probeBtn.type = 'button';
+          probeBtn.textContent = '探测';
+          probeBtn.addEventListener('click', function () { probeTarget(srcSrv, true); });
+          tip.appendChild(document.createElement('br'));
+          tip.appendChild(probeBtn);
+          return tip;
+        },
+      });
       syncSelAll.textContent = '全选';
       syncSelAll.disabled = true;
+      reconcileCards(syncList, 'sync', entries);
       updateSyncSelBtn();
       return;
     }
     if (!missing.length) {
-      markNewCards('sync', []); // 空列表：重置键集，下次出现时重新播入场动效
-      prevCards.sync = [];
-      var empty = document.createElement('p');
-      empty.className = 'sync-empty';
-      empty.textContent = srcLabel + ' 中所有图片都已同步到 ' + tgtLabel;
-      syncList.appendChild(empty);
+      entries.push({
+        key: '@sync-empty',
+        sig: 'empty:' + srcLabel + '|' + tgtLabel,
+        build: function () {
+          var p = document.createElement('p');
+          p.className = 'sync-empty';
+          p.textContent = srcLabel + ' 中所有图片都已同步到 ' + tgtLabel;
+          return p;
+        },
+      });
       syncSelAll.textContent = '全选';
       syncSelAll.disabled = true;
+      reconcileCards(syncList, 'sync', entries);
       updateSyncSelBtn();
       return;
     }
-    // 记录本轮抽屉卡片键（含来源）：仅新出现的条目播入场动效
-    var syncKeys = missing.map(function (item) { return syncSourceSel.value + '|' + item.name; });
-    var syncIsNew = markNewCards('sync', syncKeys);
-    var syncCards = [];
-    missing.forEach(function (item, i) {
-      var key = syncSourceSel.value + '|' + item.name;
-      var isNew = syncIsNew(key);
-      var card = buildSyncCard(item, srcSrv, target, isNew);
-      if (isNew) card.style.animationDelay = enterDelay(i) + 'ms'; // 多张新条目逐张浮现
-      syncList.appendChild(card);
-      syncCards.push({ key: key, el: card, isNew: isNew });
+    // 待同步条目：来源 + 文件名作为键，仅新出现的条目播入场动效
+    missing.forEach(function (item) {
+      entries.push({
+        key: syncSourceSel.value + '|' + item.name,
+        sig: syncCardSig(item, srcSrv, target),
+        build: function (isNew) { return buildSyncCard(item, srcSrv, target, isNew); },
+      });
     });
-    playFlip(syncCards, first, 280); // 其余条目平滑滑到新位置
-    prevCards.sync = syncCards;
+    reconcileCards(syncList, 'sync', entries);
+    // 探测在途状态不参与签名：就地刷新删除按钮置灰与勾选可用性
+    (prevCards.sync || []).forEach(function (c) {
+      if (!c.el) return;
+      if (c.el._delBtn) c.el._delBtn.disabled = srcBusy;
+      if (c.el._check) c.el._check.disabled = syncBusy;
+    });
     // 全选按钮文案：全部已勾选 → 显示“取消全选”
     var allChecked = missing.every(function (f) { return syncSelected[f.name]; });
     syncSelAll.textContent = allChecked ? '取消全选' : '全选';

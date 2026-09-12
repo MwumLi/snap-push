@@ -984,28 +984,67 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
   });
 
   function makeEl() {
-    return {
+    const el = {
       _children: [],
       _listeners: {},
       _text: '',
       style: {},
+      parentNode: null,
       classList: { add() {}, remove() {}, contains() { return false; } },
-      appendChild(c) { this._children.push(c); return c; },
-      // 模拟真实 DOM：设置 textContent 会清空子节点（renderGrid 依赖此行为清空重建）
-      get textContent() { return this._text; },
-      set textContent(v) { this._text = String(v); this._children = []; },
+      // 模拟真实 DOM：appendChild 会先把节点从旧父节点摘除（移动语义）
+      appendChild(c) {
+        if (c && c.parentNode && c.parentNode !== el) {
+          const arr = c.parentNode._children;
+          const i = arr.indexOf(c);
+          if (i >= 0) arr.splice(i, 1);
+        }
+        if (c) c.parentNode = el;
+        el._children.push(c);
+        return c;
+      },
+      // 模拟真实 DOM：在 ref 之前插入；ref 为空则追加
+      insertBefore(c, ref) {
+        if (c && c.parentNode && c.parentNode !== el) {
+          const arr = c.parentNode._children;
+          const i = arr.indexOf(c);
+          if (i >= 0) arr.splice(i, 1);
+        }
+        if (c) c.parentNode = el;
+        if (ref == null) {
+          el._children.push(c);
+          return c;
+        }
+        const i = el._children.indexOf(ref);
+        if (i < 0) el._children.push(c);
+        else el._children.splice(i, 0, c);
+        return c;
+      },
+      removeChild(c) {
+        const i = el._children.indexOf(c);
+        if (i >= 0) el._children.splice(i, 1);
+        if (c) c.parentNode = null;
+        return c;
+      },
+      get childNodes() { return el._children; },
+      // 模拟真实 DOM：设置 textContent 会清空子节点
+      get textContent() { return el._text; },
+      set textContent(v) {
+        el._text = String(v);
+        el._children.forEach((c) => { if (c) c.parentNode = null; });
+        el._children = [];
+      },
       addEventListener(type, fn) {
-        (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+        (el._listeners[type] || (el._listeners[type] = [])).push(fn);
       },
       removeEventListener(type, fn) {
-        const a = this._listeners[type];
+        const a = el._listeners[type];
         if (!a) return;
         const i = a.indexOf(fn);
         if (i >= 0) a.splice(i, 1);
       },
       // 测试用：派发已注册的监听器（真实浏览器由用户交互触发）
       _trigger(type, ev) {
-        (this._listeners[type] || []).slice().forEach((fn) => fn(ev || {}));
+        (el._listeners[type] || []).slice().forEach((fn) => fn(ev || {}));
       },
       getAttribute() { return ''; },
       setAttribute() {},
@@ -1029,6 +1068,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       placeholder: '',
       files: null,
     };
+    return el;
   }
 
   // 递归查找 mock 节点树里的节点（供测试定位删除按钮等）
@@ -1214,6 +1254,213 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       findNode(grid, (n) => n.style && n.style.animationDelay === '0ms'),
       '入场卡片应写入交错 animation-delay',
     );
+  });
+
+  // 回归：切换目标时「立即渲染 + 探测返回再渲染」会连续 renderGrid 两次，
+  // 已存在的卡片必须复用同一 DOM 元素（而非清空重建重放动画，表现为元素先出现→消失→再出现）。
+  test('探测返回后的二次渲染复用已存在卡片元素', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.history', JSON.stringify({
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    }));
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    let releaseRemote;
+    const remoteGate = new Promise((r) => { releaseRemote = r; }); // 挂起探测，制造「图库先渲染、探测后渲染」
+    const fetchShim = async (url) => {
+      const u = String(url);
+      if (u.includes('/api/remote')) {
+        await remoteGate;
+        return { ok: true, status: 200, json: async () => ({ ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }] }) };
+      }
+      if (u.includes('/api/library')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 30)); // 等图库渲染（探测仍挂起）
+    const grid = byId['grid'];
+    const before = grid._children[0];
+    assert.ok(before && hasText(before, 'local.png'), '首次渲染应有本地卡片');
+
+    releaseRemote(); // 放行探测 → 触发第二次渲染
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(grid._children[0], before, '二次渲染应复用同一卡片元素，而非清空重建');
+    assert.equal(grid._children.length, 1, '不应产生重复卡片');
+  });
+
+  // 回归：探测后新增的远端独有卡片应播入场动效，而既有本地卡片元素保持不变。
+  test('探测后新增远端独有卡片入场，既有本地卡片被复用', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const REMOTE_ONLY = 'ffffffffffffffffffffffffffffffff-remote.png';
+    const REMOTE_ONLY_MD5 = 'ffffffffffffffffffffffffffffffff';
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.history', JSON.stringify({
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    }));
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    let releaseRemote;
+    const remoteGate = new Promise((r) => { releaseRemote = r; });
+    const fetchShim = async (url) => {
+      const u = String(url);
+      if (u.includes('/api/remote')) {
+        await remoteGate;
+        return {
+          ok: true, status: 200,
+          json: async () => ({ ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE_ONLY, md5: REMOTE_ONLY_MD5 }] }),
+        };
+      }
+      if (u.includes('/api/library')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 30));
+    const grid = byId['grid'];
+    const localCard = grid._children[0];
+    assert.ok(localCard && hasText(localCard, 'local.png'), '首次渲染应有本地卡片');
+
+    releaseRemote();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(grid._children[0], localCard, '既有本地卡片应复用同一元素');
+    assert.equal(grid._children.length, 2, '应新增一张远端独有卡片');
+    const remoteCard = findNode(grid, (n) => typeof n.className === 'string' && n.className.includes('card-enter') && hasText(n, 'remote.png'));
+    assert.ok(remoteCard, '新增的远端独有卡片应带入场动效');
+    assert.ok(!hasText(localCard, 'remote.png'), '本地卡片不应混入远端独有内容');
+  });
+
+  // 回归：删除出场动画进行中若被并发对账渲染，正在出场的卡片不得被提前移除（_leaving 保护）。
+  test('删除出场动画期间并发对账不移除正在出场的卡片', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+
+    const LOCAL = `${HEX32}-local.png`;
+    const KEY = '127.0.0.1|/tmp/x';
+    const store = new Map();
+    store.set('snap-push.servers', JSON.stringify([
+      { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
+    ]));
+    store.set('snap-push.target', JSON.stringify('s1'));
+    store.set('snap-push.history', JSON.stringify({
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    }));
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
+    }));
+
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return store.has(k) ? store.get(k) : null; },
+      setItem(k, v) { store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    let deleteCalled = false;
+    const fetchShim = async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || 'GET';
+      if (method === 'DELETE') {
+        deleteCalled = true;
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      if (u.includes('/api/library')) {
+        return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
+      }
+      if (u.includes('/api/remote')) {
+        // 删除后远端清单变空，避免 refreshHistory 用旧快照把记录「恢复」回来
+        return { ok: true, status: 200, json: async () => ({ ok: true, dirExists: true, hasRsync: true, files: deleteCalled ? [] : [{ name: LOCAL, md5: HEX32 }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+
+    await new Promise((r) => setTimeout(r, 60)); // 等初始渲染与探测完成
+    const grid = byId['grid'];
+    const card = grid._children[0];
+    assert.ok(card && hasText(card, 'local.png'), '删除前应有本地卡片');
+
+    findDeleteBtn(grid)._trigger('click'); // 触发删除 → 确认
+    byId['confirmOk']._trigger('click');
+    await new Promise((r) => setTimeout(r, 30)); // 等 DELETE 完成、出场动画开始
+    assert.equal(card._leaving, true, '出场动画期间卡片应标记 _leaving');
+
+    byId['recheckBtn']._trigger('click'); // 并发强制对账 → 触发一次渲染
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(grid._children.indexOf(card) >= 0, '并发对账不得移除正在出场的卡片');
+
+    await new Promise((r) => setTimeout(r, 500)); // 等出场动画结束 + refreshHistory 重绘
+    assert.ok(!hasText(grid, 'local.png'), '动画结束后卡片应被移除');
   });
 
   // 回归：删除远端后，refreshHistory 不得用过期探测快照把记录“恢复”回来。
