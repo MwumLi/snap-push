@@ -605,25 +605,20 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; }
 .empty { color: #8b949e; }
 
-/* —— 卡片新增/删除动效：弹跳上浮 + 抖动淡出（图库网格与同步抽屉共用） —— */
-/* 入场：自下而上弹入，60% 处轻微过冲回弹；交错延迟由页面按序号写入 animation-delay */
+/* —— 卡片新增/删除动效（图库网格与同步抽屉共用）——
+   新增：从下滑入 + 淡入 + 模糊到清晰；删除：缩小 + 旋转滑出 + 淡出。
+   交错延迟由页面按序号写入 animation-delay；入场用 backwards，动画结束后不残留 filter 图层。 */
 @keyframes card-in {
-  0% { opacity: 0; transform: translateY(20px) scale(.82); }
-  60% { opacity: 1; transform: translateY(-4px) scale(1.03); }
-  100% { opacity: 1; transform: translateY(0) scale(1); }
+  0%   { opacity: 0; transform: translateY(16px); filter: blur(5px); }
+  100% { opacity: 1; transform: translateY(0);    filter: blur(0); }
 }
-/* 出场：先左右抖动，再缩小淡出 */
 @keyframes card-out {
-  0% { opacity: 1; transform: translateX(0) scale(1); }
-  20% { transform: translateX(-6px) scale(1); }
-  40% { transform: translateX(6px) scale(1); }
-  60% { transform: translateX(-4px) scale(1); }
-  80% { opacity: 1; transform: translateX(4px) scale(.98); }
-  100% { opacity: 0; transform: translateX(0) scale(.6); }
+  0%   { opacity: 1; transform: translateX(0) rotate(0) scale(1); }
+  100% { opacity: 0; transform: translateX(26px) rotate(4deg) scale(.82); }
 }
-.card-enter { animation: card-in .42s ease-out both; }
+.card-enter { animation: card-in .38s cubic-bezier(.22,1,.36,1) backwards; }
 /* 放在 .card-enter 之后：删除时同一元素可能同时带两类，需由出场动画覆盖入场 */
-.card-leave { animation: card-out .38s ease-in both; pointer-events: none; }
+.card-leave { animation: card-out .32s ease-in both; pointer-events: none; }
 /* 系统开启「减少动态效果」时不做动画，直接呈现终态 */
 @media (prefers-reduced-motion: reduce) { .card-enter, .card-leave { animation: none; } }
 
@@ -2077,7 +2072,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 删除出场动效：给卡片追加 .card-leave，等动画播完再由 refreshHistory 重建移除。
   // 仅在网络删除成功后调用，确保不会出现「卡片已消失但实际没删掉」。
   // el 为空（异常/垫片）时直接 resolve，不阻塞删除流程。
-  var LEAVE_MS = 380; // 与 CSS .card-leave 动画时长（抖动 + 缩小淡出）保持一致
+  var LEAVE_MS = 320; // 与 CSS .card-leave 动画时长（旋转滑出 + 缩小淡出）保持一致
   function animateOut(el) {
     return new Promise(function (resolve) {
       if (!el || typeof el.className !== 'string') { resolve(); return; }

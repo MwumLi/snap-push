@@ -707,11 +707,13 @@ describe('HTTP 基础接口', () => {
     assert.ok(html.includes("makeStateBadge('stale', '远端已删')"), '应含“远端已删”状态标识');
     // 回归守卫：抽屉条目过多时卡片不得被 flex 压缩（否则操作行被裁且无法滚动）
     assert.ok(html.includes('.sync-card { width: 100%; flex: 0 0 auto; }'), '抽屉卡片应 flex:0 0 auto 防止压缩');
-    // 卡片新增/删除动效：淡入 + 缩放（图库网格与同步抽屉共用）
+    // 卡片新增/删除动效：从下滑入 + 模糊到清晰；缩小 + 旋转滑出（图库网格与同步抽屉共用）
     assert.ok(html.includes('@keyframes card-in'), '应含卡片入场关键帧');
     assert.ok(html.includes('@keyframes card-out'), '应含卡片出场关键帧');
     assert.ok(html.includes('.card-enter'), '应含卡片入场类');
     assert.ok(html.includes('.card-leave'), '应含卡片出场类');
+    assert.ok(html.includes('filter: blur(5px)'), '入场动效应含“模糊到清晰”');
+    assert.ok(html.includes('rotate(4deg)'), '出场动效应含“旋转滑出”');
     assert.ok(html.includes('prefers-reduced-motion'), '应尊重系统“减少动态效果”设置');
     // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
     assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
