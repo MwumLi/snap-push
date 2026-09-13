@@ -3712,6 +3712,7 @@ export function start() {
     console.log(`snap-push 已启动：http://${host}:${port}`);
     console.log(`本机图片目录：${resolveSnapDir()}`);
     console.log(`配置/数据目录：${resolveConfigDir()}`);
+    console.log(`远端缓存目录：${resolveCacheDir()}`);
   });
   return server;
 }
