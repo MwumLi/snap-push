@@ -34,6 +34,11 @@ import {
   runBuffer,
   syncToRemote,
   pullToLocal,
+  createJsonStore,
+  validateServerFields,
+  resolveConfigDir,
+  resolveSnapDir,
+  resolveCacheDir,
 } from '../src/server.js';
 
 const HEX32 = 'd41d8cd98f00b204e9800998ecf8427e'; // 合法的 32 位小写 hex 样例（md5("")）
@@ -158,8 +163,17 @@ describe('纯函数：validateDir', () => {
     assert.equal(validateDir('/data/images_v2.bak'), '/data/images_v2.bak');
   });
 
-  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠 / .. 穿越）', () => {
-    const badValues = ['tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/', '/tmp/../etc', '/../etc', '/a/../../b'];
+  test('家目录形式 ~/... 合法并归一化', () => {
+    assert.equal(validateDir('~/snap-push'), '~/snap-push');
+    assert.equal(validateDir('~/snap-push/'), '~/snap-push');
+    assert.equal(validateDir('~/a/b'), '~/a/b');
+  });
+
+  test('非法输入返回 null（相对路径 / 特殊字符 / 空 / 仅斜杠 / ~ 根 / .. 穿越）', () => {
+    const badValues = [
+      'tmp/no-leading-slash', '/tmp/a b', "/tmp/a';rm", '/tmp/a;b', '', undefined, '/', '~',
+      '~snap-push', '~//', '~/../etc', '/tmp/../etc', '/../etc', '/a/../../b', '~/a/../b',
+    ];
     for (const bad of badValues) {
       assert.equal(validateDir(bad), null, `validateDir 应拒绝: ${JSON.stringify(bad)}`);
     }
@@ -236,6 +250,12 @@ describe('纯函数：buildRemoteListScript', () => {
       '  echo ::DIR_MISSING::;',
       'fi',
     ].join('\n'));
+  });
+
+  test('家目录形式 ~/snap-push 展开为 "$HOME/snap-push"（远端 shell 展开）', () => {
+    const script = buildRemoteListScript('~/snap-push');
+    assert.ok(script.includes('if [ -d "$HOME/snap-push" ]; then'));
+    assert.ok(script.includes('ls -1 "$HOME/snap-push" 2>/dev/null;'));
   });
 });
 
@@ -356,6 +376,14 @@ describe('纯函数：buildProbeScript（妙传探测脚本）', () => {
   test('名字不符合 <md5>- 约定时条件退化为 false：强制 MISSING（宁可重传不跳过）', () => {
     const script = buildProbeScript('foo.png', '/tmp/d');
     assert.equal(script, `mkdir -p '/tmp/d'; if false; then echo EXISTS; else echo MISSING; fi`);
+  });
+
+  test('家目录形式 ~/d 用 "$HOME/d" 展开，且文件名并入同一表达式', () => {
+    const script = buildProbeScript(`${HEX32}-x.png`, '~/d');
+    assert.equal(
+      script,
+      `mkdir -p "$HOME/d"; if test -f "$HOME/d/${HEX32}-x.png" && md5sum "$HOME/d/${HEX32}-x.png" 2>/dev/null | grep -q '^${HEX32}'; then echo EXISTS; else echo MISSING; fi`,
+    );
   });
 });
 
@@ -546,10 +574,12 @@ describe('GET / DELETE /api/remote-file（远端缩略图）', () => {
   let server;
   let base;
   let snapDir;
+  let cacheDir;
 
   before(async () => {
     snapDir = path.join(tmpRoot, 'remote-file');
-    ({ server, base } = await startServer({ snapDir }));
+    cacheDir = path.join(tmpRoot, 'remote-file-cache');
+    ({ server, base } = await startServer({ snapDir, cacheDir }));
   });
 
   after(async () => {
@@ -562,7 +592,6 @@ describe('GET / DELETE /api/remote-file（远端缩略图）', () => {
     const name = `${HEX32}-cached.png`;
     // 复现服务端的缓存键：sha1(host|dir) 前 12 位 + '-' + 文件名
     const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
-    const cacheDir = path.join(snapDir, '.remote-cache');
     fs.mkdirSync(cacheDir, { recursive: true });
     fs.writeFileSync(path.join(cacheDir, `${key}-${name}`), Buffer.from([1, 2, 3, 4]));
 
@@ -662,10 +691,12 @@ describe('HTTP 基础接口', () => {
   let server;
   let base;
   let snapDir;
+  let cacheDir;
 
   before(async () => {
     snapDir = path.join(tmpRoot, 'shared');
-    ({ server, base } = await startServer({ snapDir }));
+    cacheDir = path.join(tmpRoot, 'shared-cache');
+    ({ server, base } = await startServer({ snapDir, cacheDir }));
   });
 
   after(async () => {
@@ -684,6 +715,8 @@ describe('HTTP 基础接口', () => {
     assert.equal(body.id.hostname, os.hostname());
     assert.equal(body.id.ip, undefined, '身份不应包含 ip');
     assert.ok(/^[0-9a-f]{8}$/.test(body.id.hash), `hash 应为 8 位 hex：${body.id.hash}`);
+    // 缓存目录应回显注入值，便于确认 SNAP_PUSH_CACHE_DIR 生效
+    assert.equal(body.cacheDir, cacheDir);
   });
 
   test('GET / → 200 占位 HTML（含 snap-push）', async () => {
@@ -966,6 +999,289 @@ describe('HTTP 体积上限（maxBody=1024 注入）', () => {
 // =====================================================================
 
 // =====================================================================
+// 四·五、服务端配置与数据目录（createJsonStore + /api/servers + /api/history）
+// =====================================================================
+
+describe('createJsonStore（服务端 JSON 存储）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-push-store-'));
+  const file = path.join(dir, 'servers.json');
+
+  test('缺失文件回退默认值', () => {
+    assert.deepEqual(createJsonStore(file, []).read(), []);
+  });
+
+  test('写入后可读回', async () => {
+    const store = createJsonStore(file, []);
+    await store.update((s) => { s.push({ id: 's1' }); });
+    assert.deepEqual(store.read(), [{ id: 's1' }]);
+  });
+
+  test('损坏内容回退默认值', () => {
+    fs.writeFileSync(file, '{ not json');
+    assert.deepEqual(createJsonStore(file, []).read(), []);
+  });
+
+  test('形状不符回退默认值（数组 fallback 遇对象）', () => {
+    fs.writeFileSync(file, JSON.stringify({ a: 1 }));
+    assert.deepEqual(createJsonStore(file, []).read(), []);
+  });
+
+  test('形状不符回退默认值（对象 fallback 遇数组）', () => {
+    const f = path.join(dir, 'h.json');
+    fs.writeFileSync(f, JSON.stringify([]));
+    assert.deepEqual(createJsonStore(f, {}).read(), {});
+  });
+
+  test('并发 update 串行不丢更新', async () => {
+    const f = path.join(dir, 'c.json');
+    const store = createJsonStore(f, []);
+    await Promise.all([0, 1, 2, 3, 4].map((i) => store.update((s) => { s.push(i); })));
+    assert.deepEqual(store.read().sort((a, b) => a - b), [0, 1, 2, 3, 4]);
+  });
+
+  test('写入文件权限为 0600', async () => {
+    const f = path.join(dir, 'm.json');
+    await createJsonStore(f, []).update(() => {});
+    assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  });
+
+  test('resolveConfigDir 默认位置与显式注入', () => {
+    const old = process.env.SNAP_PUSH_CONFIG_DIR;
+    delete process.env.SNAP_PUSH_CONFIG_DIR;
+    assert.ok(resolveConfigDir({}).endsWith(path.join('.config', 'snap-push')));
+    assert.equal(resolveConfigDir({ configDir: '/tmp/x' }), '/tmp/x');
+    process.env.SNAP_PUSH_CONFIG_DIR = '/tmp/y';
+    assert.equal(resolveConfigDir({}), '/tmp/y');
+    if (old === undefined) delete process.env.SNAP_PUSH_CONFIG_DIR;
+    else process.env.SNAP_PUSH_CONFIG_DIR = old;
+  });
+
+  test('resolveSnapDir 默认 ~/snap-push 与显式注入/环境变量', () => {
+    const old = process.env.SNAP_PUSH_DIR;
+    delete process.env.SNAP_PUSH_DIR;
+    assert.equal(resolveSnapDir({}), path.join(os.homedir(), 'snap-push'));
+    assert.equal(resolveSnapDir({ snapDir: '/tmp/x' }), '/tmp/x');
+    process.env.SNAP_PUSH_DIR = '/tmp/y';
+    assert.equal(resolveSnapDir({}), '/tmp/y');
+    if (old === undefined) delete process.env.SNAP_PUSH_DIR;
+    else process.env.SNAP_PUSH_DIR = old;
+  });
+
+  test('resolveCacheDir 默认系统临时目录且按 uid 隔离，支持覆盖', () => {
+    const old = process.env.SNAP_PUSH_CACHE_DIR;
+    delete process.env.SNAP_PUSH_CACHE_DIR;
+    const def = resolveCacheDir({});
+    assert.ok(def.startsWith(os.tmpdir()), `应在临时目录下：${def}`);
+    assert.ok(def.includes('snap-push-cache'), `应含应用名：${def}`);
+    assert.equal(resolveCacheDir({ cacheDir: '/tmp/c' }), '/tmp/c');
+    process.env.SNAP_PUSH_CACHE_DIR = '/tmp/d';
+    assert.equal(resolveCacheDir({}), '/tmp/d');
+    if (old === undefined) delete process.env.SNAP_PUSH_CACHE_DIR;
+    else process.env.SNAP_PUSH_CACHE_DIR = old;
+  });
+});
+
+describe('纯函数：validateServerFields', () => {
+  test('完整合法', () => {
+    assert.equal(validateServerFields({ host: 'h1', dir: '/tmp/x' }).ok, true);
+  });
+  test('host 非法', () => {
+    assert.equal(validateServerFields({ host: 'bad host', dir: '/tmp/x' }).ok, false);
+  });
+  test('dir 非法', () => {
+    assert.equal(validateServerFields({ host: 'h1', dir: 'relative' }).ok, false);
+  });
+  test('urlBase 非 http(s) 前缀', () => {
+    assert.equal(validateServerFields({ host: 'h1', dir: '/tmp/x', urlBase: 'ftp://x' }).ok, false);
+  });
+  test('partial 仅校验出现的字段', () => {
+    assert.equal(validateServerFields({ label: 'x' }, true).ok, true);
+  });
+});
+
+describe('服务端 servers 接口', () => {
+  let server, base, configDir;
+  before(async () => {
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-push-cfg-'));
+    ({ server, base } = await startServer({ configDir }));
+  });
+  after(() => server.close());
+
+  const srv = { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' };
+  const post = (body) => fetch(`${base}/api/servers`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  test('GET 初始为空数组', async () => {
+    const r = await (await fetch(`${base}/api/servers`)).json();
+    assert.deepEqual(r.servers, []);
+  });
+
+  test('POST 新增并可读回', async () => {
+    assert.equal((await post(srv)).status, 200);
+    const r = await (await fetch(`${base}/api/servers`)).json();
+    assert.equal(r.servers.length, 1);
+    assert.equal(r.servers[0].host, '127.0.0.1');
+    assert.equal(r.servers[0].user, 'root');
+  });
+
+  test('重复 id 返回 409', async () => {
+    assert.equal((await post(srv)).status, 409);
+  });
+
+  test('PATCH 局部更新保留其他字段', async () => {
+    const res = await fetch(`${base}/api/servers/s1`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: 'B' }),
+    });
+    assert.equal(res.status, 200);
+    const r = await (await fetch(`${base}/api/servers`)).json();
+    assert.equal(r.servers[0].label, 'B');
+    assert.equal(r.servers[0].host, '127.0.0.1');
+  });
+
+  test('PATCH 不存在返回 404', async () => {
+    const res = await fetch(`${base}/api/servers/nope`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: 'x' }),
+    });
+    assert.equal(res.status, 404);
+  });
+
+  test('非法 host 返回 400', async () => {
+    assert.equal((await post({ ...srv, id: 's2', host: 'bad host' })).status, 400);
+  });
+
+  test('缺少 id 返回 400', async () => {
+    assert.equal((await post({ host: 'h1', dir: '/tmp/x' })).status, 400);
+  });
+
+  test('非法 JSON 返回 400', async () => {
+    const res = await fetch(`${base}/api/servers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{ not json',
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test('落盘 servers.json（数组形状）', async () => {
+    const file = path.join(configDir, 'servers.json');
+    assert.ok(fs.existsSync(file));
+    assert.ok(Array.isArray(JSON.parse(fs.readFileSync(file, 'utf8'))));
+  });
+
+  test('DELETE 删除', async () => {
+    assert.equal((await fetch(`${base}/api/servers/s1`, { method: 'DELETE' })).status, 200);
+    const r = await (await fetch(`${base}/api/servers`)).json();
+    assert.deepEqual(r.servers, []);
+  });
+
+  test('重启后配置仍在（同一 configDir）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-push-restart-'));
+    const a = await startServer({ configDir: dir });
+    await fetch(`${a.base}/api/servers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...srv, id: 's7' }),
+    });
+    await new Promise((r) => a.server.close(r));
+    const b = await startServer({ configDir: dir });
+    const r = await (await fetch(`${b.base}/api/servers`)).json();
+    assert.equal(r.servers[0].id, 's7');
+    await new Promise((res) => b.server.close(res));
+  });
+});
+
+describe('服务端 history 接口', () => {
+  let server, base, configDir;
+  before(async () => {
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-push-hcfg-'));
+    ({ server, base } = await startServer({ configDir }));
+  });
+  after(() => server.close());
+
+  const NAME = `${HEX32}-a.png`;
+  const NAME2 = `${'a'.repeat(32)}-b.png`;
+  const entry = {
+    orig: 'a.png',
+    targets: [{
+      key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+      remoteName: NAME, remotePath: `/tmp/x/${NAME}`, url: '',
+      method: 'rsync', origin: 'push', time: new Date().toISOString(),
+    }],
+  };
+  const put = (name, body) => fetch(`${base}/api/history/${encodeURIComponent(name)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  test('GET 初始为空对象', async () => {
+    const r = await (await fetch(`${base}/api/history`)).json();
+    assert.deepEqual(r.history, {});
+  });
+
+  test('PUT 单条 upsert', async () => {
+    assert.equal((await put(NAME, entry)).status, 200);
+    const r = await (await fetch(`${base}/api/history`)).json();
+    assert.equal(r.history[NAME].orig, 'a.png');
+    assert.equal(r.history[NAME].targets.length, 1);
+  });
+
+  test('非法 name 返回 400', async () => {
+    assert.equal((await put('../etc/passwd', entry)).status, 400);
+  });
+
+  test('targets 非数组返回 400', async () => {
+    assert.equal((await put(NAME2, { orig: 'b.png', targets: 'x' })).status, 400);
+  });
+
+  test('batch upserts + deletes', async () => {
+    const res = await fetch(`${base}/api/history/batch`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ upserts: { [NAME2]: { orig: 'b.png', targets: [] } }, deletes: [NAME] }),
+    });
+    assert.equal(res.status, 200);
+    const r = await (await fetch(`${base}/api/history`)).json();
+    assert.ok(r.history[NAME2]);
+    assert.ok(!r.history[NAME]);
+  });
+
+  test('batch 含非法 upsert 返回 400 且不写入', async () => {
+    const res = await fetch(`${base}/api/history/batch`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ upserts: { 'bad name': { orig: 'x', targets: [] } } }),
+    });
+    assert.equal(res.status, 400);
+    const r = await (await fetch(`${base}/api/history`)).json();
+    assert.ok(!r.history['bad name']);
+  });
+
+  test('DELETE 单条（幂等）', async () => {
+    assert.equal((await fetch(`${base}/api/history/${encodeURIComponent(NAME2)}`, { method: 'DELETE' })).status, 200);
+    assert.equal((await fetch(`${base}/api/history/${encodeURIComponent(NAME2)}`, { method: 'DELETE' })).status, 200);
+    const r = await (await fetch(`${base}/api/history`)).json();
+    assert.deepEqual(r.history, {});
+  });
+
+  test('落盘 history.json（对象形状）', async () => {
+    const file = path.join(configDir, 'history.json');
+    assert.ok(fs.existsSync(file));
+    const h = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(typeof h, 'object');
+    assert.ok(!Array.isArray(h));
+  });
+
+  test('重启后历史仍在（同一 configDir）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snap-push-hrestart-'));
+    const a = await startServer({ configDir: dir });
+    await fetch(`${a.base}/api/history/${encodeURIComponent(NAME)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry),
+    });
+    await new Promise((r) => a.server.close(r));
+    const b = await startServer({ configDir: dir });
+    const r = await (await fetch(`${b.base}/api/history`)).json();
+    assert.equal(r.history[NAME].orig, 'a.png');
+    await new Promise((res) => b.server.close(res));
+  });
+});
+
+
+// =====================================================================
 // 五、内嵌页面脚本冒烟（DOM 垫片）
 // 用最小 DOM 垫片执行页面脚本，捕获初始化期的 ReferenceError / TypeError。
 // 不追求行为正确，只作为“页面脚本可被浏览器解析并初始化”的回归守卫。
@@ -1098,6 +1414,25 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
   }
 
+  // 页面测试的 fetch 垫片外层：拦截服务端配置/历史接口，其余交给 baseShim。
+  // 配置/历史已改存服务端，测试不再通过 localStorage 预置，而是用 state 注入。
+  function withStateFetch(baseShim, state) {
+    return async (url, opts) => {
+      const u = String(url);
+      const method = (opts && opts.method) || 'GET';
+      if (u.includes('/api/servers') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ ok: true, servers: state.servers || [] }) };
+      }
+      if (u.includes('/api/history') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ ok: true, history: state.history || {} }) };
+      }
+      if (u.includes('/api/servers') || u.includes('/api/history')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      return baseShim(url, opts);
+    };
+  }
+
   // 定位卡片上的「删除」按钮（className=danger 且文本为「删除」）
   function findDeleteBtn(root) {
     return findNode(root, (n) => n.className === 'danger' && n.textContent === '删除');
@@ -1150,12 +1485,12 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const STALE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-stale.png';
 
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
     // STALE：有 history 记录但远端已无 → 应显示「远端已删」
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [STALE]: {
         orig: 'stale.png',
         targets: [{
@@ -1164,7 +1499,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', stale: true, time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       '127.0.0.1|/tmp/x': {
         fetchedAt: Date.now(),
@@ -1179,7 +1514,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       setItem(k, v) { store.set(k, String(v)); },
     };
     const windowShim = { confirm() { return true; }, alert() {} };
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       let body;
       if (u.includes('/api/library')) {
@@ -1193,7 +1528,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         body = { ok: true };
       }
       return { ok: true, status: 200, json: async () => body };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1265,11 +1600,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
     const LOCAL = `${HEX32}-local.png`;
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1278,7 +1613,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1289,7 +1624,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const windowShim = { confirm() { return true; }, alert() {} };
     let releaseRemote;
     const remoteGate = new Promise((r) => { releaseRemote = r; }); // 挂起探测，制造「图库先渲染、探测后渲染」
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       if (u.includes('/api/remote')) {
         await remoteGate;
@@ -1299,7 +1634,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1328,11 +1663,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const REMOTE_ONLY = 'ffffffffffffffffffffffffffffffff-remote.png';
     const REMOTE_ONLY_MD5 = 'ffffffffffffffffffffffffffffffff';
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1341,7 +1676,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1352,7 +1687,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const windowShim = { confirm() { return true; }, alert() {} };
     let releaseRemote;
     const remoteGate = new Promise((r) => { releaseRemote = r; });
-    const fetchShim = async (url) => {
+    const fetchShim = withStateFetch(async (url) => {
       const u = String(url);
       if (u.includes('/api/remote')) {
         await remoteGate;
@@ -1365,7 +1700,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1396,11 +1731,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const LOCAL = `${HEX32}-local.png`;
     const KEY = '127.0.0.1|/tmp/x';
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1409,7 +1744,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
     }));
@@ -1422,7 +1757,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1437,7 +1772,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return { ok: true, status: 200, json: async () => ({ ok: true, dirExists: true, hasRsync: true, files: deleteCalled ? [] : [{ name: LOCAL, md5: HEX32 }] }) };
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1474,11 +1809,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const KEY = '127.0.0.1|/tmp/x';
 
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1487,7 +1822,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
     store.set('snap-push.remoteIndex', JSON.stringify({
       [KEY]: { fetchedAt: Date.now(), files: [{ name: LOCAL, md5: HEX32 }] },
     }));
@@ -1500,7 +1835,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1516,7 +1851,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         body = { ok: true };
       }
       return { ok: true, status: 200, json: async () => body };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(
@@ -1548,11 +1883,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
     const LOCAL = `${HEX32}-local.png`;
     const store = new Map();
-    store.set('snap-push.servers', JSON.stringify([
+    const servers = [
       { id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' },
-    ]));
+    ];
     store.set('snap-push.target', JSON.stringify('s1'));
-    store.set('snap-push.history', JSON.stringify({
+    const history = {
       [LOCAL]: {
         orig: 'local.png',
         targets: [{
@@ -1561,7 +1896,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
           method: 'rsync', time: new Date().toISOString(),
         }],
       },
-    }));
+    };
 
     const byId = {};
     const documentShim = makeDocumentShim(byId);
@@ -1571,7 +1906,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     };
     const windowShim = { confirm() { return true; }, alert() {} };
     let deleteCalled = false;
-    const fetchShim = async (url, opts) => {
+    const fetchShim = withStateFetch(async (url, opts) => {
       const u = String(url);
       const method = (opts && opts.method) || 'GET';
       if (method === 'DELETE') {
@@ -1585,7 +1920,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return new Promise(() => {}); // 永不 resolve：让探测一直处于在途
       }
       return { ok: true, status: 200, json: async () => ({ ok: true }) };
-    };
+    }, { servers, history });
 
     // eslint-disable-next-line no-new-func
     new Function(

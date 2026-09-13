@@ -21,8 +21,13 @@ import { pathToFileURL } from 'node:url';
 // =====================================================================
 const DEFAULT_HOST = '127.0.0.1';            // 仅监听本机回环，避免暴露到网络
 const DEFAULT_PORT = 8123;
-const DEFAULT_SNAP_DIR = '/tmp/snap-push';   // 本机图片落盘目录
+// 本机图片落盘目录：放家目录持久保存，避免 /tmp 重启被清空导致图库与历史一起丢
+const DEFAULT_SNAP_DIR = () => path.join(os.homedir(), 'snap-push');
+// 远端缩略图缓存目录：放系统临时目录（可随时丢失、由系统清理），按 uid 隔离避免多用户权限冲突
+const DEFAULT_CACHE_DIR = () =>
+  path.join(os.tmpdir(), `snap-push-cache-${typeof process.getuid === 'function' ? process.getuid() : 'u'}`);
 const MAX_BODY_BYTES = 20 * 1024 * 1024;     // 上传体积上限：20MB
+const MAX_JSON_BODY = 4 * 1024 * 1024;       // 配置/历史 JSON 请求体上限：4MB
 const SUBPROCESS_TIMEOUT_MS = 30_000;        // ssh/rsync/scp 单次执行超时
 const PROBE_TIMEOUT_MS = 10_000;             // 目标探测超时：探测是后台行为，收短避免长时间占用
 const STDERR_SUMMARY_LIMIT = 300;            // 错误信息中 stderr 摘要的最大长度
@@ -70,17 +75,54 @@ export const validateHost = validateWord;
 export const validateUser = validateWord;
 
 /**
- * 校验远端目录：必须以 / 开头，且仅包含 [A-Za-z0-9._/-]；去掉尾部斜杠统一格式。
- * 非法（相对路径 / 空值 / 特殊字符 / 仅一个 /）返回 null。
+ * 校验远端目录：绝对路径（`/...`）或家目录形式（`~/...`）。
+ * - `~` 仅允许出现在开头；裸 `~`（家目录根本身）拒绝，避免直接写满家目录；
+ * - 路径部分仅允许 [A-Za-z0-9._/-]，去掉尾部斜杠统一格式；
+ * - 拒绝任何 `..` 路径段：/tmp/../etc 这类目录会把远端读/删能力放大到父目录。
+ * 非法返回 null，合法返回归一化后的路径（如 `/tmp/snap-push`、`~/snap-push`）。
  */
 export function validateDir(v) {
-  if (typeof v !== 'string' || !v.startsWith('/')) return null;
-  if (!/^[A-Za-z0-9._/-]+$/.test(v)) return null;
-  const trimmed = v.replace(/\/+$/, '');
-  if (trimmed.length === 0) return null;
-  // 拒绝 .. 路径段：/tmp/../etc 这类目录会把远端读/删能力放大到父目录
-  if (trimmed.split('/').some((seg) => seg === '..')) return null;
+  if (typeof v !== 'string') return null;
+  let rest; // 去掉前导 ~ 后的剩余部分：'' 或 '/...'
+  let home = false;
+  if (v === '~') {
+    return null; // 不允许把家目录根当目标
+  } else if (v.startsWith('~/')) {
+    home = true;
+    rest = v.slice(1); // '/...'
+  } else if (v.startsWith('/')) {
+    rest = v;
+  } else {
+    return null;
+  }
+  // 字符白名单：~ 只允许在开头，故 rest 中不含 ~；拒绝空格/引号/分号/反引号等
+  if (rest !== '' && !/^\/[A-Za-z0-9._/-]*$/.test(rest)) return null;
+  const trimmed = ((home ? '~' : '') + rest).replace(/\/+$/, '');
+  if (trimmed === '' || trimmed === '/' || trimmed === '~') return null;
+  // 拒绝 .. 路径段：/tmp/../etc 或 ~/../etc
+  if (trimmed.replace(/^~\//, '').split('/').some((seg) => seg === '..')) return null;
   return trimmed;
+}
+
+/**
+ * 把已过 validateDir 的远端目录转成远端 shell 里安全的表达式：
+ * - 绝对路径 → 单引号 `'/tmp/x'`（无展开，现状不变）；
+ * - `~/x` → `"$HOME/x"`（远端 shell 展开家目录；x 已过白名单，不含 $/反引号/引号，双引号安全）。
+ */
+function remoteShellDir(dir) {
+  if (dir === '~') return '"$HOME"';
+  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}"`;
+  return `'${dir}'`;
+}
+
+/**
+ * 远端目录下某文件的 shell 表达式：
+ * - 绝对路径 → 单引号整体 `'/tmp/x/a.png'`（与改造前输出一致）；
+ * - `~/x` → `"$HOME/x/a.png"`（远端 shell 展开家目录；x/name 已过白名单，无 $/反引号/引号）。
+ */
+function remoteShellFile(dir, name) {
+  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}/${name}"`;
+  return `'${dir}/${name}'`;
 }
 
 /**
@@ -125,14 +167,15 @@ export function validateRemoteFileName(name) {
  *   1) 目录不存在/不可读 → 只输出 __DIR_MISSING__，前端按“远端为空”处理；
  *   2) 用 command -v 检测远端是否装了 rsync（决定 pull 走 rsync 还是 scp）；
  *   3) ls -1 列出目录内文件名，交给 parseRemoteList 过滤解析。
- * dir 进入本函数前已过 validateDir 白名单，嵌入单引号是安全的。
+ * dir 进入本函数前已过 validateDir 白名单，由 remoteShellDir 安全嵌入远端命令。
  */
 export function buildRemoteListScript(dir) {
+  const d = remoteShellDir(dir);
   return [
-    `if [ -d '${dir}' ]; then`,
+    `if [ -d ${d} ]; then`,
     '  echo ::DIR_OK::;',
     '  command -v rsync >/dev/null 2>&1 && echo ::RSYNC_OK:: || echo ::RSYNC_NO::;',
-    `  ls -1 '${dir}' 2>/dev/null;`,
+    `  ls -1 ${d} 2>/dev/null;`,
     'else',
     '  echo ::DIR_MISSING::;',
     'fi',
@@ -189,8 +232,24 @@ export function mimeOf(name) {
 // 身份采用「首次运行生成并持久化的随机 secret」，刻意不依赖 hostname/IP——
 // 否则切网/VPN/重启后 IP 或 hostname 变化会导致身份变化，浏览器里
 // 按实例隔离的目标/历史数据看起来「丢失」。身份文件一旦生成就稳定复用。
-const DEFAULT_ID_FILE = () =>
-  path.join(os.homedir(), '.config', 'snap-push', 'instance-id');
+const DEFAULT_CONFIG_DIR = () =>
+  path.join(os.homedir(), '.config', 'snap-push');
+
+// app 配置与数据目录：SNAP_PUSH_CONFIG_DIR 或 ~/.config/snap-push；
+// 目录内保存 instance-id（身份）、servers.json（服务器配置）、history.json（同步记录）。
+export function resolveConfigDir(opts = {}) {
+  return opts.configDir || process.env.SNAP_PUSH_CONFIG_DIR || DEFAULT_CONFIG_DIR();
+}
+
+// 本机图片落盘目录：SNAP_PUSH_DIR 或 ~/snap-push（持久化，避免 /tmp 重启清空）
+export function resolveSnapDir(opts = {}) {
+  return opts.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR();
+}
+
+// 远端缩略图缓存目录：SNAP_PUSH_CACHE_DIR 或系统临时目录（可随时丢弃、由系统清理）
+export function resolveCacheDir(opts = {}) {
+  return opts.cacheDir || process.env.SNAP_PUSH_CACHE_DIR || DEFAULT_CACHE_DIR();
+}
 
 // 默认路径身份 secret 的进程内缓存：避免每次请求都读一次文件
 let cachedSecret = null;
@@ -216,12 +275,13 @@ export function getOrCreateSecret(opts = {}) {
   if (opts.secret) return opts.secret;
   const fromEnv = process.env.SNAP_PUSH_ID;
   if (fromEnv) return fromEnv;
-  const idFile = opts.secretFile || process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE();
+  const configDir = resolveConfigDir(opts);
+  const defaultFile = path.join(configDir, 'instance-id');
+  const idFile = opts.secretFile || process.env.SNAP_PUSH_ID_FILE || defaultFile;
+  // 仅默认路径参与进程内缓存；测试注入自定义路径时每次直读，避免串缓存
+  const cacheable = !opts.secretFile && !process.env.SNAP_PUSH_ID_FILE;
   try {
-    // 进程内缓存只用于默认文件路径；测试注入自定义路径时每次直读，避免串缓存
-    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
-      if (cachedSecret) return cachedSecret;
-    }
+    if (cacheable && cachedSecret) return cachedSecret;
     let secret = null;
     try {
       secret = fs.readFileSync(idFile, 'utf8').trim();
@@ -233,9 +293,7 @@ export function getOrCreateSecret(opts = {}) {
       fs.mkdirSync(path.dirname(idFile), { recursive: true });
       fs.writeFileSync(idFile, secret + '\n', { mode: 0o600 });
     }
-    if (idFile === (process.env.SNAP_PUSH_ID_FILE || DEFAULT_ID_FILE())) {
-      cachedSecret = secret;
-    }
+    if (cacheable) cachedSecret = secret;
     return secret;
   } catch {
     return ''; // home 不可写等：交由调用方用 hostname 兜底
@@ -409,15 +467,15 @@ async function scpFallback(localPath, name, target) {
  *      安全默认：宁可重传也不跳过（rsync -a 增量下重传代价可忽略）。
  * 名字不符合 <md5>- 约定时（正常流程不会发生）条件退化为 false：强制 MISSING。
  * 安全说明：name/dir 进入本函数前均已通过白名单校验，期望 md5 为纯 hex，
- *           嵌入远端命令串没有注入面。
+ *           由 remoteShellDir/remoteShellFile 安全嵌入远端命令，没有注入面。
  */
 export function buildProbeScript(name, dir) {
   const expectedMd5 = /^[0-9a-f]{32}/.exec(name)?.[0];
-  const remoteFile = `${dir}/${name}`;
+  const remoteFile = remoteShellFile(dir, name);
   const existsCheck = expectedMd5
-    ? `test -f '${remoteFile}' && md5sum '${remoteFile}' 2>/dev/null | grep -q '^${expectedMd5}'`
+    ? `test -f ${remoteFile} && md5sum ${remoteFile} 2>/dev/null | grep -q '^${expectedMd5}'`
     : 'false';
-  return `mkdir -p '${dir}'; if ${existsCheck}; then echo EXISTS; else echo MISSING; fi`;
+  return `mkdir -p ${remoteShellDir(dir)}; if ${existsCheck}; then echo EXISTS; else echo MISSING; fi`;
 }
 
 /**
@@ -508,6 +566,58 @@ export async function pullToLocal(localPath, name, { host, user, dir }) {
 }
 
 // =====================================================================
+// 三·五、服务端 JSON 存储：app 配置与数据目录下的持久化文件
+// =====================================================================
+
+/**
+ * 通用 JSON 存储：文件缺失、内容损坏或形状不符时回退 fallback，绝不抛异常。
+ *
+ * update(mutator) 串行 read-modify-write：mutator 同步修改 state 并返回结果，
+ * 随后原子写（写同目录临时文件 → rename 覆盖），避免并发丢更新与半截文件。
+ * 每个 store 一条内部写链，同一文件不交叉；不同文件互不阻塞。
+ *
+ * @param {string} file 目标文件绝对路径
+ * @param {any} fallback 期望形状（数组或对象）；read 后形状不符也回退
+ * @param {(value:any)=>boolean} [isValid] 自定义形状校验；缺省按 fallback 类型判断
+ */
+export function createJsonStore(file, fallback, isValid) {
+  const check = isValid || ((v) =>
+    Array.isArray(fallback)
+      ? Array.isArray(v)
+      : (v !== null && typeof v === 'object' && !Array.isArray(v)));
+  let chain = Promise.resolve();
+
+  function read() {
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      return check(value) ? value : fallback;
+    } catch {
+      return fallback; // 文件不存在 / 内容损坏：回退默认值
+    }
+  }
+
+  function writeSync(state) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
+
+  function update(mutator) {
+    const job = chain.then(() => {
+      const state = read();
+      const result = mutator(state);
+      writeSync(state);
+      return result;
+    });
+    chain = job.catch(() => {}); // 吞掉失败，保持写链不中断
+    return job;
+  }
+
+  return { read, update };
+}
+
+// =====================================================================
 // 四、HTTP 服务
 // =====================================================================
 
@@ -521,10 +631,10 @@ function sendJson(res, status, obj) {
  * 内嵌单页应用（设计文档第 6 节）：原生 JS + 内联 CSS，无任何外部资源。
  *
  * 页面结构：
- *   - 顶部：目标下拉（本机 + localStorage 服务器配置）与「⚙ 管理」配置面板（增/改/删）；
+ *   - 顶部：目标下拉（本机 + 服务端 servers.json 里的服务器配置）与「⚙ 管理」配置面板（增/改/删）；
  *   - 上传区：文件选择 / 拖拽 / Ctrl+V 粘贴截图，逐文件 POST /upload 并展示结果；
  *   - 图库：按当前目标渲染全部图片（本地存在 + 远端独有），
- *     /api/library 与 localStorage 历史（snap-push.history）求交，远端独有取自 remoteIndex，
+ *     /api/library 与服务端 history.json（经 /api/history 读取）求交，远端独有取自 remoteIndex，
  *     按当前目标（host+dir）过滤，支持复制路径/URL、删除（联动清历史记录）、对账清理。
  *
  * 安全约定：动态内容一律 createElement + textContent，绝不拼接 innerHTML；
@@ -697,7 +807,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       <span class="field"><label for="fLabel">昵称（可选）</label><input id="fLabel" placeholder="如：测试机"></span>
       <span class="field"><label for="fHost">IP / 主机名（必填）</label><input id="fHost" required placeholder="如 192.168.1.10"></span>
       <span class="field"><label for="fUser">用户名</label><input id="fUser" placeholder="默认 root"></span>
-      <span class="field"><label for="fDir">远端目录</label><input id="fDir" placeholder="默认 /tmp/snap-push"></span>
+      <span class="field"><label for="fDir">远端目录</label><input id="fDir" placeholder="默认 ~/snap-push"></span>
       <span class="field"><label for="fUrlBase">静态 URL 前缀（可选）</label><input id="fUrlBase" placeholder="如 https://cdn.example.com/snap"></span>
       <div>
         <button type="submit">保存</button>
@@ -762,19 +872,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 (function () {
   'use strict';
 
-  // =============== localStorage 封装 ===============
-  // 读取失败（未存过/内容损坏/隐私模式禁用）时静默回退默认值；
-  // 写入失败只是不持久化，都不阻断页面功能。
-  //
+  // =============== 浏览器本地存储（仅用户偏好与缓存） ===============
+  // 服务器配置与同步记录已改为存服务端（~/.config/snap-push/servers.json / history.json），
+  // 浏览器 localStorage 只保留两类「本浏览器」数据：
+  //   - target：上次选中的目标（用户偏好）；
+  //   - remoteIndex：远端清单缓存（可随时重建）。
   // 存储键按「本实例服务 ID」命名空间隔离：同一浏览器经 ssh -L 先后指向
-  // 不同机器的 snap-push 时，地址都是 127.0.0.1:8123（同源），各实例的
-  // 配置/历史/目标记忆互不串扰；data-svc 缺失（旧缓存页面）则回退旧键名。
+  // 不同机器的 snap-push 时，地址都是 127.0.0.1:8123（同源），各实例的目标记忆/
+  // 远端缓存互不串扰；data-svc 缺失（旧缓存页面）则回退旧键名。
   var svcHash = (document.body && document.body.getAttribute('data-svc')) || '';
   function storageKey(base) {
     return svcHash ? 'snap-push@' + svcHash + '.' + base : 'snap-push.' + base;
   }
-  var SERVERS_KEY = storageKey('servers');
-  var HISTORY_KEY = storageKey('history');
   var TARGET_KEY = storageKey('target'); // 记忆上次选中的目标（'local' 或服务器 id），刷新后恢复
   var REMOTE_INDEX_KEY = storageKey('remoteIndex'); // 远端清单缓存：{"<host>|<dir>": {fetchedAt, files}}
 
@@ -796,12 +905,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 一次性迁移：升级到「按实例命名空间」之前，旧键（snap-push.*）里可能存有
-  // 配置/历史/目标。仅当本实例命名空间尚无数据时，把旧键数据复制过去（只复制不删除，安全）。
+  // 一次性迁移：升级到「按实例命名空间」之前，旧键（snap-push.*）里可能存有目标选择。
+  // 仅当本实例命名空间尚无数据时，把旧键数据复制过去（只复制不删除，安全）。
+  // 注：servers/history 已迁到服务端，不再读取浏览器旧键。
   function legacyKey(base) { return 'snap-push.' + base; }
   function migrateLegacy() {
     if (!svcHash) return; // 旧缓存页面本身就在用旧键，无需迁移
-    ['servers', 'history', 'target'].forEach(function (base) {
+    ['target'].forEach(function (base) {
       var ns = storageKey(base);
       if (loadJson(ns, null) !== null) return; // 命名空间已有数据，不覆盖
       var raw = null;
@@ -814,12 +924,49 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
   migrateLegacy();
 
+  // =============== 服务端配置/历史：读写封装 ===============
+  // 统一 JSON 请求：非 2xx 或 ok:false 时抛中文错误，由调用方决定提示与否。
+  async function apiJson(url, options) {
+    var res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      throw new Error('网络请求失败：' + (e && e.message ? e.message : e));
+    }
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok || !data || data.ok === false) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+    return data;
+  }
+  function jsonOpts(method, body) {
+    return { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  }
+  async function loadServers() {
+    var data = await apiJson('/api/servers');
+    servers = Array.isArray(data.servers) ? data.servers : [];
+  }
+  async function loadHistory() {
+    var data = await apiJson('/api/history');
+    history = (data.history && typeof data.history === 'object' && !Array.isArray(data.history)) ? data.history : {};
+  }
+  // 写失败只提示、不阻断：内存态已乐观更新，刷新后以服务端为准
+  function persistFail(e) {
+    hint('保存到服务端失败：' + (e && e.message ? e.message : e), true);
+  }
+  function createServerRemote(s) { return apiJson('/api/servers', jsonOpts('POST', s)); }
+  function updateServerRemote(id, patch) { return apiJson('/api/servers/' + encodeURIComponent(id), jsonOpts('PATCH', patch)); }
+  function deleteServerRemote(id) { return apiJson('/api/servers/' + encodeURIComponent(id), { method: 'DELETE' }); }
+  function saveHistoryEntry(name) { return apiJson('/api/history/' + encodeURIComponent(name), jsonOpts('PUT', history[name])); }
+  function deleteHistoryEntry(name) { return apiJson('/api/history/' + encodeURIComponent(name), { method: 'DELETE' }); }
+  function batchHistory(payload) { return apiJson('/api/history/batch', jsonOpts('POST', payload)); }
+
   // =============== 页面状态 ===============
-  var servers = loadJson(SERVERS_KEY, []); // [{id,label,host,user,dir,urlBase}]
-  if (!Array.isArray(servers)) servers = [];
+  var servers = []; // 服务端 servers.json 的镜像：[{id,label,host,user,dir,urlBase}]
   // history 结构：{"<localName>": {orig, targets: [{key,label,host,dir,remotePath,url,method,time}]}}
-  var history = loadJson(HISTORY_KEY, {});
-  if (typeof history !== 'object' || history === null || Array.isArray(history)) history = {};
+  var history = {}; // 服务端 history.json 的镜像
+  var serverStatus = {}; // 内存态探测状态：serverId -> {reachable,dirExists,hasRsync,error,lastProbe}（不持久化）
   var libFiles = []; // 最近一次 GET /api/library 的文件清单
   var remoteIndex = loadJson(REMOTE_INDEX_KEY, {}); // 远端清单缓存，见 REMOTE_INDEX_KEY
   if (typeof remoteIndex !== 'object' || remoteIndex === null || Array.isArray(remoteIndex)) remoteIndex = {};
@@ -1085,10 +1232,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   //   2) 有记录但远端无 → 标 stale（仅当该记录在本次探测开始前就已确认，避免把探测期间新上传误标）；
   //   3) 本地有字节、远端有同 md5、却缺记录 → 补录 recovered（同 md5 只补“规范文件”一条）。
   // probeStartedAt：本次探测发起时间，用于竞态判断。
-  function reconcileWithRemote(srv, files, probeStartedAt) {
+  async function reconcileWithRemote(srv, files, probeStartedAt) {
     var byMd5 = {};
     (files || []).forEach(function (f) { if (f.md5) byMd5[f.md5] = f.name; });
-    var changed = false;
+    var touched = {}; // 本次发生变更的 history 条目名 → 末尾一次性批量落库
 
     // 1) 已有记录的：确认 / 失效
     libFiles.forEach(function (lf) {
@@ -1098,13 +1245,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       var t = findTargetRec(lf.name, srv);
       if (!t) return;
       if (remoteName) {
-        if (t.stale) { delete t.stale; changed = true; }
-        if (t.remoteName !== remoteName) { t.remoteName = remoteName; changed = true; }
+        if (t.stale) { delete t.stale; touched[lf.name] = true; }
+        if (t.remoteName !== remoteName) { t.remoteName = remoteName; touched[lf.name] = true; }
         t.verifiedAt = Date.now();
-        changed = true;
+        touched[lf.name] = true;
       } else if (!t.stale && (!t.verifiedAt || t.verifiedAt < probeStartedAt)) {
         t.stale = true; // 远端已删：标记失效
-        changed = true;
+        touched[lf.name] = true;
       }
     });
 
@@ -1129,24 +1276,29 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         rec = history[lfName] = { orig: origOf(lfName), targets: [] };
       }
       rec.targets.push(makeRecoveredTarget(srv, byMd5[md5]));
-      changed = true;
+      touched[lfName] = true;
     });
 
-    if (changed) saveJson(HISTORY_KEY, history);
+    var names = Object.keys(touched);
+    if (!names.length) return;
+    var upserts = {};
+    names.forEach(function (n) { upserts[n] = history[n]; });
+    try {
+      await batchHistory({ upserts: upserts });
+    } catch (e) {
+      persistFail(e);
+    }
   }
 
-  // 记录探测状态到 servers[i].status（持久化“上次已知”，下次打开先显示再刷新）
+  // 记录探测状态到内存（属及时性信息，不持久化；刷新后重新探测）
   function saveServerStatus(srv, patch) {
-    var s = serverById(srv.id);
-    if (!s) return;
-    s.status = s.status || {};
-    for (var k in patch) s.status[k] = patch[k];
-    s.status.lastProbe = Date.now();
-    saveJson(SERVERS_KEY, servers);
+    var st = serverStatus[srv.id] || (serverStatus[srv.id] = {});
+    for (var k in patch) st[k] = patch[k];
+    st.lastProbe = Date.now();
   }
 
-  // 探测成功：落 remoteIndex、写状态、按目标对账
-  function applyProbe(srv, data, probeStartedAt) {
+  // 探测成功：落 remoteIndex、写内存状态、按目标对账
+  async function applyProbe(srv, data, probeStartedAt) {
     remoteIndex[targetKey(srv)] = { fetchedAt: Date.now(), files: data.files || [] };
     saveJson(REMOTE_INDEX_KEY, remoteIndex);
     saveServerStatus(srv, {
@@ -1155,7 +1307,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       hasRsync: !!data.hasRsync,
       error: '',
     });
-    reconcileWithRemote(srv, data.files || [], probeStartedAt);
+    await reconcileWithRemote(srv, data.files || [], probeStartedAt);
   }
 
   // 探测失败：只记状态，绝不改历史记录（否则会把整批记录误判为失效）
@@ -1175,6 +1327,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     probeSeq[key] = seq;
     probeBusy[key] = true;
     renderStatus();
+    renderGrid(); // 探测在途：就地置灰删除按钮（否则本次 renderGrid 早于探测，按钮不会禁用）
     var startedAt = Date.now(); // 竞态基准：早于此刻确认过的记录，才允许被本次探测判为失效
     var data = null;
     try {
@@ -1193,7 +1346,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (probeSeq[key] !== seq) return; // 已切到别的目标或发起了更新的探测：丢弃本次结果
     probeBusy[key] = false;
     probeState[key] = { at: Date.now(), data: data };
-    if (data.ok) applyProbe(srv, data, startedAt);
+    if (data.ok) await applyProbe(srv, data, startedAt);
     else markProbeError(srv, data.error);
     renderStatus();
     renderGrid();
@@ -1226,8 +1379,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (!srv) return;
     var key = targetKey(srv);
     if (probeBusy[key]) { targetStatus.textContent = '检测中…'; return; }
-    var s = serverById(srv.id);
-    var st = s && s.status;
+    var st = serverStatus[srv.id];
     if (!st) { targetStatus.textContent = '未探测'; return; }
     if (!st.reachable) {
       targetStatus.textContent = '离线';
@@ -1253,12 +1405,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return 's' + Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
   }
 
-  // 目录校验（与服务端白名单一致）：以 / 开头、字符白名单、去尾部斜杠；'/' 本身非法
+  // 目录校验（与服务端 validateDir 一致）：绝对路径 /... 或家目录 ~/...、
+  // 字符白名单、去尾部斜杠；拒绝裸 ~、裸 / 与任何 .. 路径段。
+  // 注意：页面 JS 位于外层模板字符串内，禁用反斜杠，故正则不写转义斜杠。
   function validDir(v) {
-    if (v.charAt(0) !== '/') return null;
-    var d = stripTrailingSlash(v);
-    if (d === '' || d === '/') return null;
-    if (!/^[A-Za-z0-9._/-]+$/.test(d)) return null;
+    var home = false;
+    var rest;
+    if (v === '~') return null;
+    if (v.charAt(0) === '~' && v.charAt(1) === '/') { home = true; rest = v.slice(1); }
+    else if (v.charAt(0) === '/') { rest = v; }
+    else return null;
+    if (rest !== '' && !/^[A-Za-z0-9._/-]*$/.test(rest)) return null;
+    var d = stripTrailingSlash((home ? '~' : '') + rest);
+    if (d === '' || d === '/' || d === '~') return null;
+    var body = (d.indexOf('~/') === 0) ? d.slice(2) : d;
+    var segs = body.split('/');
+    for (var i = 0; i < segs.length; i++) { if (segs[i] === '..') return null; }
     return d;
   }
 
@@ -1317,11 +1479,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     formMsg.textContent = '';
   }
 
-  function removeServer(s) {
+  async function removeServer(s) {
     if (!window.confirm('确定删除服务器「' + (s.label || s.host) + '」的配置吗？（历史推送记录保留）')) return;
     var idx = servers.indexOf(s);
     if (idx >= 0) servers.splice(idx, 1);
-    saveJson(SERVERS_KEY, servers);
+    delete serverStatus[s.id]; // 旧探测状态作废
+    try { await deleteServerRemote(s.id); } catch (e) { persistFail(e); }
     resetForm();
     renderServerList();
     renderTargetSel(); // 若删的是当前选中项，选择会回退到本机
@@ -1329,12 +1492,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     hint('已删除服务器配置');
   }
 
-  serverForm.addEventListener('submit', function (e) {
+  serverForm.addEventListener('submit', async function (e) {
     e.preventDefault();
     var label = fLabel.value.trim();
     var host = fHost.value.trim();
     var user = fUser.value.trim() || 'root';       // 用户名缺省 root
-    var dirRaw = fDir.value.trim() || '/tmp/snap-push'; // 目录缺省 /tmp/snap-push
+    var dirRaw = fDir.value.trim() || '~/snap-push'; // 目录缺省 ~/snap-push（远端用户家目录下）
     var urlBase = stripTrailingSlash(fUrlBase.value.trim()); // 去尾斜杠避免拼出双斜杠
 
     // 客户端预校验（与服务端白名单一致）：尽早给出中文提示，避免提交后才报错
@@ -1345,7 +1508,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     var dir = validDir(dirRaw);
     if (!dir) {
-      formMsg.textContent = '远端目录不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠';
+      formMsg.textContent = '远端目录不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）';
       return;
     }
     if (urlBase && urlBase.indexOf('http://') !== 0 && urlBase.indexOf('https://') !== 0) {
@@ -1361,12 +1524,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       s.user = user;
       s.dir = dir;
       s.urlBase = urlBase;
-      delete s.status; // host/dir 可能已变：旧探测状态作废
+      delete serverStatus[s.id]; // 配置可能已变：旧探测状态作废
+      try {
+        await updateServerRemote(s.id, { label: label, host: host, user: user, dir: dir, urlBase: urlBase });
+      } catch (err) { persistFail(err); }
     } else {
       s = { id: genId(), label: label, host: host, user: user, dir: dir, urlBase: urlBase };
       servers.push(s);
+      try { await createServerRemote(s); } catch (err) { persistFail(err); }
     }
-    saveJson(SERVERS_KEY, servers);
     resetForm();
     renderServerList();
     renderTargetSel();
@@ -1435,7 +1601,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   }
 
   // 上传成功写入历史：同 host+dir 的记录覆盖；本机目标固定 key='local'（host/dir 为空串）
-  function recordUpload(data, orig, srv) {
+  async function recordUpload(data, orig, srv) {
     var rec = {
       key: srv ? srv.id : 'local',
       label: srv ? (srv.label || srv.host) : '本机',
@@ -1463,7 +1629,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       }
     }
     if (!replaced) entry.targets.push(rec);
-    saveJson(HISTORY_KEY, history);
+    try { await saveHistoryEntry(data.localName); } catch (e) { persistFail(e); }
   }
 
   // 单文件上传：body 直接放 File 对象（浏览器按原始字节发送）
@@ -1486,7 +1652,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (!res.ok || !jsonOk || !data.ok) {
         throw new Error(data.error || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
       }
-      recordUpload(data, name, srv);
+      await recordUpload(data, name, srv);
 
       // 成功态：方式徽标 + 路径（有 URL 再加一行）+ 各自的复制按钮
       entry.status.textContent = '';
@@ -1594,7 +1760,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   // 拉取本机图库 → 对账 → 渲染。
   // 关键：失败时直接返回（跳过对账与渲染）——若以空清单继续对账，
-  // 会把 localStorage 中的推送记录误当「本地文件已删除」而全部清空；
+  // 会把服务端保存的推送记录误当「本地文件已删除」而全部清空；
   // 成功但清单为空（文件确实都删了）才允许正常对账清理。
   async function refreshHistory() {
     var seq = ++historySeq;
@@ -1622,21 +1788,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var cur = currentServer();
     var cached = cur && probeState[targetKey(cur)];
     if (cur && cached && cached.data && cached.data.ok) {
-      reconcileWithRemote(cur, cached.data.files || [], cached.at);
+      await reconcileWithRemote(cur, cached.data.files || [], cached.at);
     }
-    reconcile();
+    await reconcile();
     renderGrid();
   }
 
-  // 对账：以服务端图库为准，本地文件已删除的清掉其历史记录
-  function reconcile() {
+  // 对账：以服务端图库为准，本地文件已删除的清掉其历史记录（批量落库）
+  async function reconcile() {
     var known = {};
     libFiles.forEach(function (f) { known[f.name] = true; });
-    var changed = false;
+    var deletes = [];
     Object.keys(history).forEach(function (k) {
-      if (!known[k]) { delete history[k]; changed = true; }
+      if (!known[k]) { delete history[k]; deletes.push(k); }
     });
-    if (changed) saveJson(HISTORY_KEY, history);
+    if (!deletes.length) return;
+    try { await batchHistory({ deletes: deletes }); } catch (e) { persistFail(e); }
   }
 
   // 卡片键追踪：由 reconcileCards 按「上一轮已存在的键」决定是否播入场动效。
@@ -2113,14 +2280,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
   }
 
-  // 从本地 history 移除某目标记录；本地条目保留（仍可作本机预览）
-  function dropTargetRecord(name, srv) {
+  // 从服务端 history 移除某目标记录；本地条目保留（仍可作本机预览）
+  async function dropTargetRecord(name, srv) {
     var rec = history[name];
     if (!rec || !Array.isArray(rec.targets)) return;
     rec.targets = rec.targets.filter(function (t) {
       return !(t.host === srv.host && t.dir === srv.dir);
     });
-    saveJson(HISTORY_KEY, history);
+    try { await saveHistoryEntry(name); } catch (e) { persistFail(e); }
   }
 
   // 从 remoteIndex 缓存移除某文件名（删远端后保持缓存一致）
@@ -2251,7 +2418,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       window.alert('删除失败：' + (err.message || err));
       return;
     }
-    dropTargetRecord(name, srv);
+    await dropTargetRecord(name, srv);
     dropRemoteIndexFile(srv, remoteName);
     await leaveCardWithReflow(cardEl, container, scope); // 删除成功后出场 + 兄弟并行补位
     hint('已从 ' + (srv.label || srv.host) + ' 删除');
@@ -2292,7 +2459,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       return;
     }
     delete history[name];
-    saveJson(HISTORY_KEY, history);
+    try { await deleteHistoryEntry(name); } catch (e) { persistFail(e); }
     await leaveCardWithReflow(cardEl, container, scope); // 删除成功后出场 + 兄弟并行补位
     hint('已删除');
     refreshHistory();
@@ -2334,7 +2501,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (!res.ok || !jsonOk || !data.ok) {
       throw new Error((data && data.error) || ('HTTP ' + res.status + (jsonOk ? '' : '（响应非 JSON）')));
     }
-    recordUpload(data, origOf(name), srv);
+    await recordUpload(data, origOf(name), srv);
     return data;
   }
 
@@ -2750,7 +2917,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       okText: '清理',
     });
     if (!r.confirmed) return;
-    staleNames.forEach(function (k) { dropTargetRecord(k, srv); });
+    var upserts = {};
+    staleNames.forEach(function (k) {
+      var rec = history[k];
+      if (!rec || !Array.isArray(rec.targets)) return;
+      rec.targets = rec.targets.filter(function (t) {
+        return !(t.host === srv.host && t.dir === srv.dir);
+      });
+      upserts[k] = rec;
+    });
+    if (Object.keys(upserts).length) {
+      try { await batchHistory({ upserts: upserts }); } catch (e) { persistFail(e); }
+    }
     hint('已清理 ' + staleNames.length + ' 条失效记录');
     refreshHistory();
   }
@@ -2777,11 +2955,22 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var srv = currentServer();
     if (srv) probeTarget(srv, false);
   });
-  renderTargetSel();
-  refreshHistory();
-  // 页面加载：对上次记住的服务器目标探测一次
-  var initSrv = currentServer();
-  if (initSrv) probeTarget(initSrv, false);
+
+  // 启动：先从服务端拉取配置与历史，再渲染目标下拉与图库，最后探测上次目标。
+  // 配置/历史存服务端，故初始化是异步的；加载失败给出提示并停止渲染（避免用空数据误对账）。
+  async function boot() {
+    try {
+      await Promise.all([loadServers(), loadHistory()]);
+    } catch (e) {
+      hint('加载服务端配置失败：' + (e && e.message ? e.message : e), true);
+      return;
+    }
+    renderTargetSel();
+    await refreshHistory();
+    var initSrv = currentServer();
+    if (initSrv) probeTarget(initSrv, false);
+  }
+  boot();
 })();
 </script>
 </body>
@@ -2832,6 +3021,20 @@ function safeDecode(segment) {
   }
 }
 
+/**
+ * 读取并解析 JSON 请求体（上限 MAX_JSON_BODY）。
+ * 非法 JSON / 非对象返回 null，由调用方按 400 处理；超限抛 413。
+ */
+async function readJsonBody(req) {
+  const buf = await readBodyWithLimit(req, MAX_JSON_BODY);
+  try {
+    const value = JSON.parse(buf.toString('utf8'));
+    return (value !== null && typeof value === 'object') ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 确保 snapDir 存在（幂等；upload 与 library 前调用） */
 async function ensureDir(dir) {
   await fs.promises.mkdir(dir, { recursive: true });
@@ -2875,7 +3078,7 @@ async function handleUpload(req, res, params, ctx) {
     const dir = validateDir(dirRaw);
     if (!dir) {
       req.resume();
-      return sendJson(res, 400, { ok: false, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' });
+      return sendJson(res, 400, { ok: false, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' });
     }
     target = { host: validHost, user, dir };
   }
@@ -2945,7 +3148,7 @@ function parseTargetParams(params) {
   }
   const dir = validateDir(dirRaw);
   if (!dir) {
-    return { ok: false, status: 400, error: 'dir 不合法：必须以 / 开头，且仅允许字母、数字、点、下划线、连字符、斜杠' };
+    return { ok: false, status: 400, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' };
   }
   return { ok: true, target: { host, user, dir }, urlBase: params.get('urlBase') || '' };
 }
@@ -3039,17 +3242,17 @@ async function findLocalByMd5(snapDir, md5) {
  * 不同目标下同名文件（尤其是不带 md5 前缀的手工文件）内容可能不同，
  * 只用文件名做键会互相覆盖、串图，因此把目标身份也纳入键。
  */
-function remoteCachePath(snapDir, host, dir, name) {
+function remoteCachePath(cacheDir, host, dir, name) {
   const key = crypto.createHash('sha1').update(`${host}|${dir}`).digest('hex').slice(0, 12);
-  return path.join(snapDir, '.remote-cache', `${key}-${name}`);
+  return path.join(cacheDir, `${key}-${name}`);
 }
 
 /**
  * GET /api/remote-file?host=&user=&dir=&name=
  * 按需从远端读取单个文件字节（缩略图/预览）：
- *   1) 命中本地缓存 .remote-cache/<name> → 直接回放；
+ *   1) 命中缓存目录（SNAP_PUSH_CACHE_DIR，默认系统临时目录）→ 直接回放；
  *   2) 未命中 → ssh cat 取回 → 原子写入缓存 → 回给浏览器。
- * 缓存目录以点号开头，readdir 时不会被 isValidStoredName 收录进图库。
+ * 缓存属可丢弃数据，放临时目录、由系统清理；键含 host|dir 短 hash 防串图。
  */
 async function handleRemoteFile(req, res, params, ctx) {
   req.resume(); // 无请求体
@@ -3059,8 +3262,8 @@ async function handleRemoteFile(req, res, params, ctx) {
   if (!pt.ok) return sendJson(res, pt.status, { ok: false, error: pt.error });
   const { host, user, dir } = pt.target;
 
-  const cacheDir = path.join(ctx.snapDir, '.remote-cache');
-  const cachePath = remoteCachePath(ctx.snapDir, host, dir, name);
+  const cacheDir = ctx.cacheDir;
+  const cachePath = remoteCachePath(cacheDir, host, dir, name);
   try {
     const stat = await fs.promises.stat(cachePath);
     if (stat.isFile()) return sendFile(res, cachePath, name); // 缓存命中
@@ -3070,7 +3273,7 @@ async function handleRemoteFile(req, res, params, ctx) {
 
   let r;
   try {
-    r = await runBuffer('ssh', [...SSH_ARGS, `${user}@${host}`, `cat '${dir}/${name}'`]);
+    r = await runBuffer('ssh', [...SSH_ARGS, `${user}@${host}`, `cat ${remoteShellFile(dir, name)}`]);
   } catch (err) {
     return sendJson(res, 502, { ok: false, error: err.message || '读取远端文件失败' });
   }
@@ -3109,7 +3312,7 @@ async function handleRemoteDelete(req, res, params, ctx) {
 
   let r;
   try {
-    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, `rm -f '${dir}/${name}'`]);
+    r = await run('ssh', [...SSH_ARGS, `${user}@${host}`, `rm -f ${remoteShellFile(dir, name)}`]);
   } catch (err) {
     return sendJson(res, 502, { ok: false, error: err.message || '删除远端文件失败' });
   }
@@ -3119,8 +3322,8 @@ async function handleRemoteDelete(req, res, params, ctx) {
       error: `删除远端文件失败（退出码 ${r.code}）：${summarizeStderr(r.stderr)}`,
     });
   }
-  // 顺带清掉本地缓存，避免删后仍能命中旧图
-  await fs.promises.rm(remoteCachePath(ctx.snapDir, host, dir, name), { force: true }).catch(() => {});
+  // 顺带清掉缓存，避免删后仍能命中旧图
+  await fs.promises.rm(remoteCachePath(ctx.cacheDir, host, dir, name), { force: true }).catch(() => {});
   return sendJson(res, 200, { ok: true });
 }
 
@@ -3229,6 +3432,153 @@ async function handleDeleteFile(res, name, ctx) {
   sendJson(res, 200, { ok: true });
 }
 
+// =====================================================================
+// 四·五、服务器配置 / 同步记录的持久化接口
+// =====================================================================
+
+/**
+ * 校验服务器配置字段：host/dir 必填且过白名单，user/urlBase 可选。
+ * partial=true 时仅校验请求体中出现的字段（供 PATCH 局部更新用）。
+ * 返回 { ok:true } 或 { ok:false, error }。
+ */
+export function validateServerFields(input, partial = false) {
+  const has = (k) => input[k] !== undefined;
+  if (!partial || has('host')) {
+    if (validateHost(input.host) === null) {
+      return { ok: false, error: 'host 不合法：仅允许字母、数字、点、下划线、连字符' };
+    }
+  }
+  if (has('user') && input.user !== '' && validateUser(input.user) === null) {
+    return { ok: false, error: 'user 不合法：仅允许字母、数字、点、下划线、连字符' };
+  }
+  if (!partial || has('dir')) {
+    if (validateDir(input.dir) === null) {
+      return { ok: false, error: 'dir 不合法：需以 / 或 ~/ 开头，且仅允许字母、数字、点、下划线、连字符、斜杠（不含 ..）' };
+    }
+  }
+  if (has('urlBase') && input.urlBase) {
+    if (typeof input.urlBase !== 'string' || !/^https?:\/\//.test(input.urlBase) || /\s/.test(input.urlBase)) {
+      return { ok: false, error: 'urlBase 不合法：需形如 https://cdn.example.com/snap' };
+    }
+  }
+  return { ok: true };
+}
+
+/** 校验 history 单条：orig 为字符串、targets 为数组；target 的 host/dir 非空时过白名单 */
+function isValidHistoryEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  if (typeof entry.orig !== 'string' || !Array.isArray(entry.targets)) return false;
+  for (const t of entry.targets) {
+    if (!t || typeof t !== 'object') return false;
+    if (t.host && validateHost(t.host) === null) return false;
+    if (t.dir && validateDir(t.dir) === null) return false;
+  }
+  return true;
+}
+
+/** GET /api/servers：返回全部服务器配置 */
+async function handleListServers(res, ctx) {
+  sendJson(res, 200, { ok: true, servers: ctx.serversStore.read() });
+}
+
+/** POST /api/servers：新增一条（id 由客户端生成）；id 重复返回 409 */
+async function handleCreateServer(req, res, ctx) {
+  const body = await readJsonBody(req);
+  if (!body || typeof body.id !== 'string' || !body.id) {
+    return sendJson(res, 400, { ok: false, error: 'id 必填' });
+  }
+  const v = validateServerFields(body);
+  if (!v.ok) return sendJson(res, 400, { ok: false, error: v.error });
+  const entry = {
+    id: body.id,
+    label: String(body.label || '').slice(0, 200),
+    host: body.host,
+    user: body.user || 'root',
+    dir: body.dir,
+    urlBase: body.urlBase || '',
+  };
+  let duplicated = false;
+  await ctx.serversStore.update((list) => {
+    if (list.some((s) => s.id === entry.id)) { duplicated = true; return; }
+    list.push(entry);
+  });
+  if (duplicated) return sendJson(res, 409, { ok: false, error: '服务器配置 id 已存在' });
+  sendJson(res, 200, { ok: true, server: entry });
+}
+
+/** PATCH /api/servers/:id：局部更新；不存在返回 404 */
+async function handleUpdateServer(req, res, id, ctx) {
+  const body = await readJsonBody(req);
+  if (!body) return sendJson(res, 400, { ok: false, error: '请求体不合法' });
+  const v = validateServerFields(body, true);
+  if (!v.ok) return sendJson(res, 400, { ok: false, error: v.error });
+  let updated = null;
+  await ctx.serversStore.update((list) => {
+    const s = list.find((x) => x.id === id);
+    if (!s) return;
+    if (body.label !== undefined) s.label = String(body.label).slice(0, 200);
+    for (const k of ['host', 'user', 'dir', 'urlBase']) {
+      if (body[k] !== undefined) s[k] = body[k];
+    }
+    updated = s;
+  });
+  if (!updated) return sendJson(res, 404, { ok: false, error: '服务器配置不存在' });
+  sendJson(res, 200, { ok: true, server: updated });
+}
+
+/** DELETE /api/servers/:id：删除配置（历史记录保留）；幂等 */
+async function handleDeleteServer(res, id, ctx) {
+  await ctx.serversStore.update((list) => {
+    const i = list.findIndex((s) => s.id === id);
+    if (i >= 0) list.splice(i, 1);
+  });
+  sendJson(res, 200, { ok: true });
+}
+
+/** GET /api/history：返回全部同步记录 */
+async function handleListHistory(res, ctx) {
+  sendJson(res, 200, { ok: true, history: ctx.historyStore.read() });
+}
+
+/** PUT /api/history/:name：覆盖式 upsert 单条（name 必须为合法存储名） */
+async function handlePutHistory(req, res, name, ctx) {
+  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  const body = await readJsonBody(req);
+  if (!isValidHistoryEntry(body)) {
+    return sendJson(res, 400, { ok: false, error: '请求体不合法：需为 { orig, targets[] }' });
+  }
+  await ctx.historyStore.update((h) => { h[name] = { orig: body.orig, targets: body.targets }; });
+  sendJson(res, 200, { ok: true });
+}
+
+/** DELETE /api/history/:name：删除单条；幂等 */
+async function handleDeleteHistory(res, name, ctx) {
+  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  await ctx.historyStore.update((h) => { delete h[name]; });
+  sendJson(res, 200, { ok: true });
+}
+
+/** POST /api/history/batch：{ upserts:{name:entry}, deletes:[name] } 原子应用（对账/批量清理用） */
+async function handleBatchHistory(req, res, ctx) {
+  const body = await readJsonBody(req);
+  if (!body) return sendJson(res, 400, { ok: false, error: '请求体不合法' });
+  const upserts = (body.upserts && typeof body.upserts === 'object' && !Array.isArray(body.upserts))
+    ? body.upserts : {};
+  const deletes = Array.isArray(body.deletes) ? body.deletes : [];
+  for (const [name, entry] of Object.entries(upserts)) {
+    if (!isValidStoredName(name) || !isValidHistoryEntry(entry)) {
+      return sendJson(res, 400, { ok: false, error: `upserts 含非法项：${name}` });
+    }
+  }
+  await ctx.historyStore.update((h) => {
+    for (const [name, entry] of Object.entries(upserts)) {
+      h[name] = { orig: entry.orig, targets: entry.targets };
+    }
+    for (const name of deletes) delete h[name];
+  });
+  sendJson(res, 200, { ok: true });
+}
+
 /**
  * 路由分发。用 WHATWG URL 解析：它会规范化 ".." 路径段，
  * 例如 /files/../etc/passwd 会变成 /etc/passwd 落进 404，天然免疫目录穿越。
@@ -3243,8 +3593,9 @@ async function route(req, res, ctx) {
   const { pathname, searchParams } = url;
 
   if (req.method === 'GET' && pathname === '/health') {
-    // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器
-    return sendJson(res, 200, { ok: true, id: ctx.svcId });
+    // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器；
+    // 附带 cacheDir，便于确认 SNAP_PUSH_CACHE_DIR 是否生效
+    return sendJson(res, 200, { ok: true, id: ctx.svcId, cacheDir: ctx.cacheDir });
   }
   if (req.method === 'GET' && pathname === '/') {
     return sendIndexPage(res, ctx.svcId);
@@ -3268,6 +3619,30 @@ async function route(req, res, ctx) {
   if (req.method === 'GET' && pathname === '/api/library') {
     return handleLibrary(res, ctx);
   }
+  // —— 服务器配置（app 配置目录 servers.json）——
+  if (pathname === '/api/servers') {
+    if (req.method === 'GET') return handleListServers(res, ctx);
+    if (req.method === 'POST') return handleCreateServer(req, res, ctx);
+  }
+  if (pathname.startsWith('/api/servers/')) {
+    const id = safeDecode(pathname.slice('/api/servers/'.length));
+    if (id === null || id === '') return sendJson(res, 400, { ok: false, error: '路径不合法' });
+    if (req.method === 'PATCH') return handleUpdateServer(req, res, id, ctx);
+    if (req.method === 'DELETE') return handleDeleteServer(res, id, ctx);
+  }
+  // —— 同步记录（app 数据目录 history.json）——
+  if (pathname === '/api/history') {
+    if (req.method === 'GET') return handleListHistory(res, ctx);
+  }
+  if (pathname === '/api/history/batch' && req.method === 'POST') {
+    return handleBatchHistory(req, res, ctx);
+  }
+  if (pathname.startsWith('/api/history/')) {
+    const name = safeDecode(pathname.slice('/api/history/'.length));
+    if (name === null || name === '') return sendJson(res, 400, { ok: false, error: '路径不合法' });
+    if (req.method === 'PUT') return handlePutHistory(req, res, name, ctx);
+    if (req.method === 'DELETE') return handleDeleteHistory(res, name, ctx);
+  }
   if (pathname.startsWith('/files/')) {
     // 解码后的文件名必须严格匹配 <md5>-<安全名>，否则一律 400
     const name = safeDecode(pathname.slice('/files/'.length));
@@ -3280,13 +3655,19 @@ async function route(req, res, ctx) {
 /**
  * 创建 snap-push HTTP 服务（只创建不监听，便于测试注入目录与端口）。
  * @param {object} [options]
- * @param {string} [options.snapDir] 本机落盘目录，默认取环境变量 SNAP_PUSH_DIR 或 /tmp/snap-push
+ * @param {string} [options.snapDir] 本机图片落盘目录，默认取环境变量 SNAP_PUSH_DIR 或 ~/snap-push
+ * @param {string} [options.configDir] app 配置与数据目录，默认 SNAP_PUSH_CONFIG_DIR 或 ~/.config/snap-push
+ * @param {string} [options.cacheDir] 远端缩略图缓存目录，默认 SNAP_PUSH_CACHE_DIR 或系统临时目录
  * @param {number} [options.maxBody] 上传体积上限（字节），默认 20MB
  * @returns {import('node:http').Server}
  */
 export function createServer(options = {}) {
-  const snapDir = options.snapDir || process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR;
+  const snapDir = resolveSnapDir(options);
   const maxBody = options.maxBody || MAX_BODY_BYTES;
+  // app 配置与数据目录：servers.json（服务器配置）/ history.json（同步记录）
+  const configDir = resolveConfigDir(options);
+  // 远端缩略图缓存目录：可丢弃数据，默认放系统临时目录
+  const cacheDir = resolveCacheDir(options);
   // 实例身份在服务创建时计算一次（可注入 secret/secretFile 便于测试与固定复现）
   const svcId = computeServiceId(options);
 
@@ -3298,7 +3679,16 @@ export function createServer(options = {}) {
     return next;
   };
 
-  const ctx = { snapDir, maxBody, enqueue, svcId };
+  const ctx = {
+    snapDir,
+    maxBody,
+    enqueue,
+    svcId,
+    configDir,
+    cacheDir,
+    serversStore: createJsonStore(path.join(configDir, 'servers.json'), []),
+    historyStore: createJsonStore(path.join(configDir, 'history.json'), {}),
+  };
   const server = http.createServer((req, res) => {
     route(req, res, ctx).catch((err) => {
       // 统一兜底：抛错处可携带 statusCode（如 413），其余按 500 处理
@@ -3321,7 +3711,9 @@ export function start() {
   const server = createServer();
   server.listen(port, host, () => {
     console.log(`snap-push 已启动：http://${host}:${port}`);
-    console.log(`本机图片目录：${process.env.SNAP_PUSH_DIR || DEFAULT_SNAP_DIR}`);
+    console.log(`本机图片目录：${resolveSnapDir()}`);
+    console.log(`配置/数据目录：${resolveConfigDir()}`);
+    console.log(`远端缓存目录：${resolveCacheDir()}`);
   });
   return server;
 }

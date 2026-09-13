@@ -37,8 +37,10 @@ node snap-push/server.mjs
 |---|---|---|
 | `SNAP_PUSH_HOST` | `127.0.0.1` | Listen address (loopback only by default) |
 | `SNAP_PUSH_PORT` | `8123` | Listen port |
-| `SNAP_PUSH_DIR` | `/tmp/snap-push` | Local storage dir for images (preview / library) |
-| `SNAP_PUSH_ID_FILE` | `~/.config/snap-push/instance-id` | File persisting the per-instance identity secret (auto-created on first run) |
+| `SNAP_PUSH_DIR` | `~/snap-push` | Local storage dir for images (preview / library); persistent (not under `/tmp`) |
+| `SNAP_PUSH_CONFIG_DIR` | `~/.config/snap-push` | App config & data dir: `instance-id` (identity), `servers.json` (server configs), `history.json` (sync records) |
+| `SNAP_PUSH_CACHE_DIR` | system temp dir (`snap-push-cache-<uid>`) | Cache for remote thumbnails/previews; disposable, safe to lose |
+| `SNAP_PUSH_ID_FILE` | `<SNAP_PUSH_CONFIG_DIR>/instance-id` | File persisting the per-instance identity secret (auto-created on first run); overrides the config-dir location |
 | `SNAP_PUSH_ID` | *(empty)* | Pin a fixed instance secret (skips reading/writing the identity file) |
 
 > **On `SNAP_PUSH_HOST`**: keep the default `127.0.0.1`. This tool has **no authentication** — it is meant for local dev convenience, and exposing it to a network is unsafe (and not planned). To reach it from another machine, run snap-push on your dev host bound to loopback and forward the port over SSH, then open <http://127.0.0.1:8123> locally:
@@ -47,10 +49,22 @@ node snap-push/server.mjs
 > ssh -N -L 8123:127.0.0.1:8123 user@dev-host
 > ```
 
+## Config & data directory
+
+Server configs and sync history live **server-side** under `SNAP_PUSH_CONFIG_DIR` (default `~/.config/snap-push`), so every browser pointing at the same snap-push instance shares the same targets and history:
+
+- `servers.json` — target server configs (id / nickname / host / user / dir / URL prefix)
+- `history.json` — which image was pushed to which target (path / URL / time / method)
+- `instance-id` — the per-instance identity secret
+
+The browser only keeps lightweight per-browser preferences in localStorage: the currently selected target and a remote-listing cache (`remoteIndex`), both namespaced by instance (`snap-push@<hash>.*`).
+
+The local image library lives in `SNAP_PUSH_DIR` (default `~/snap-push`) and the remote-thumbnail cache in `SNAP_PUSH_CACHE_DIR` (default a per-user system temp dir). Unlike `/tmp`, the image dir survives reboots, so the library and the history records anchored to it are not lost.
+
 ## Usage
 
-1. **Default target is the local machine**: no remote upload — images land in the local `SNAP_PUSH_DIR`, and the page shows the absolute path.
-2. **Push to a server**: click **⚙ Manage** to add a config — nickname (optional), IP, username (default `root`), remote dir (default `/tmp/snap-push`), static URL prefix (optional). Then switch targets from the top dropdown.
+1. **Default target is the local machine**: no remote upload — images land in the local `SNAP_PUSH_DIR` (default `~/snap-push`), and the page shows the absolute path.
+2. **Push to a server**: click **⚙ Manage** to add a config — nickname (optional), IP, username (default `root`), remote dir (default `~/snap-push`, i.e. the remote user's home), static URL prefix (optional). Then switch targets from the top dropdown. A leading `~` in the remote dir expands to the remote user's home directory; if the images must survive a reboot of the remote machine, point this at a persistent, statically-served directory.
 3. **Upload** any of three ways: click to pick images, drag & drop into the upload area, or screenshot and paste with `Ctrl+V`. On success the page shows the remote path (plus URL if a prefix is configured) — copy in one click. Pasted images are named `paste_<YYYYMMDD_HHmmss>.<ext>` (for multiple images pasted at once, the 2nd onward gets a `_2`, `_3` suffix); picked/dropped images keep their original file names.
 4. **Library**: shows every image under the current target — the local view lists all local images; picking a server lists all images on that target (locally present plus remote-only ones, the latter tagged "远端独有" (remote-only) with thumbnails fetched from the remote on demand). Card titles follow the current target — i.e. the file name as it exists on that machine.
 5. **Remote reconciliation**: switching to a server target probes it asynchronously. A status badge appears next to the dropdown (online / offline / dir missing / scp fallback) along with a summary (remote-only N / missing M). A failed probe only affects the status display and never touches history. Use **Recheck** to force a refresh. Records whose remote file was deleted are marked; clean them in bulk with **Clean missing records**, or re-push from the library.
@@ -68,9 +82,17 @@ node snap-push/server.mjs
 | `GET` | `/api/remote-file` | Fetch a remote file's bytes on demand (thumbnail / preview); replays the local cache when present |
 | `DELETE` | `/api/remote-file` | Delete a single file on the remote target (idempotent) |
 | `GET` | `/api/library` | Local library listing |
+| `GET` | `/api/servers` | List server configs (from `servers.json`) |
+| `POST` | `/api/servers` | Create a server config (409 if the id already exists) |
+| `PATCH` | `/api/servers/:id` | Update a server config (partial fields) |
+| `DELETE` | `/api/servers/:id` | Delete a server config (history records are kept) |
+| `GET` | `/api/history` | List sync records (from `history.json`) |
+| `PUT` | `/api/history/:name` | Upsert one record (`{orig, targets[]}`) |
+| `DELETE` | `/api/history/:name` | Delete one record |
+| `POST` | `/api/history/batch` | Apply `{upserts, deletes}` atomically (reconciliation / bulk cleanup) |
 | `GET` | `/files/<name>` | Read a local-library file's bytes |
 | `DELETE` | `/files/<name>` | Delete a local-library file |
-| `GET` | `/health` | Health check and instance identity |
+| `GET` | `/health` | Health check, instance identity, and the effective cache dir |
 
 ## Architecture & Scenarios
 
@@ -82,7 +104,7 @@ node snap-push/server.mjs
  └───────────────────────────┬──────────────────────────────────┘
                              ▼
                  snap-push 本地服务（src/server.js）
-                 ① 落盘本机图库 /tmp/snap-push/<md5>-<原名>
+                 ① 落盘本机图库 ~/snap-push/<md5>-<原名>
                     → 预览 / 历史（同一份，多目标共享）
                  ② 对该目标 ssh 探测是否已存在同内容
                     → 已存在：妙传跳过（method: skip）
@@ -104,16 +126,16 @@ One picture tells the whole story: an image goes from the browser to the local s
 - **rsync first, scp fallback**: if the remote has rsync it transfers with `rsync -az`; otherwise it automatically degrades to `scp`. The pull (`/pull`) direction works the same way.
 - **Naming `<md5>-<original>`**: identical content → identical name → natural dedup; reconciliation and cross-server sync both use the md5 as the content identity.
 - **Instant re-upload**: before uploading, a single ssh call compares the remote file's md5. If the content already exists it skips the transfer (`method: skip`, instant). If the same-named remote file has mismatched content (e.g. a leftover partial file), it is treated as missing and re-uploaded to repair it (self-healing).
-- **On-demand reads**: remote thumbnails / previews are fetched over ssh via `/api/remote-file` (20MB per file) and cached under the local `.remote-cache/` (a dot-directory excluded from the library), so repeated views don't re-run ssh.
+- **On-demand reads**: remote thumbnails / previews are fetched over ssh via `/api/remote-file` (20MB per file) and cached under `SNAP_PUSH_CACHE_DIR` (default a per-user system temp dir; disposable), so repeated views don't re-run ssh.
 
 ## FAQ
 
 - **"ssh probe failed"**: passwordless login to the target isn't set up, or the host is unreachable. First verify with `ssh user@host` manually.
 - **Remote has no rsync**: nothing to do — it falls back to scp automatically, and the result is labeled `scp`.
-- **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails. Instant-skip logic only looks at the remote — it is independent of local storage.
+- **What is the local dir (`SNAP_PUSH_DIR`) for?** It stores preview images and the library for the page thumbnails (default `~/snap-push`, persistent across reboots). Instant-skip logic only looks at the remote — it is independent of local storage.
 - **What does "remote-only" mean?** A file that exists on the target server but has no copy in the local library (perhaps pushed by another client). It only appears in the **Sync** drawer, with its thumbnail read from the remote on demand; pull it back locally to display and redistribute it normally.
 - **Does deleting remove remote files too?** Under a server target, deletion affects only that target. Under the local target, only the local file is removed by default; tick **Also delete copies on all servers** in the dialog to cascade (the local file is deleted only after every remote deletion succeeds).
-- **Where are my configs / history stored?** In the browser's localStorage, namespaced per snap-push instance (header badge `hostname  #hash`). The instance identity is a random secret persisted at `~/.config/snap-push/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID` (or delete it and start clean in the browser).
+- **Where are my configs / history stored?** On the server, under `SNAP_PUSH_CONFIG_DIR` (default `~/.config/snap-push`): `servers.json` holds the target configs and `history.json` the sync records, so multiple browsers share them. The browser only keeps the current target and a remote-listing cache in localStorage (namespaced per instance, header badge `hostname  #hash`). The instance identity is a random secret persisted at `<SNAP_PUSH_CONFIG_DIR>/instance-id` — it deliberately does not depend on IP, so switching networks / VPN / reboots won't make your saved targets "disappear". Lost the file? Pin one with `SNAP_PUSH_ID`.
 
 ## Development
 
