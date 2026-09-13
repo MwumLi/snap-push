@@ -3593,8 +3593,9 @@ async function route(req, res, ctx) {
   const { pathname, searchParams } = url;
 
   if (req.method === 'GET' && pathname === '/health') {
-    // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器
-    return sendJson(res, 200, { ok: true, id: ctx.svcId });
+    // 附带实例标识，便于确认当前 127.0.0.1:8123 到底指向哪台机器；
+    // 附带 cacheDir，便于确认 SNAP_PUSH_CACHE_DIR 是否生效
+    return sendJson(res, 200, { ok: true, id: ctx.svcId, cacheDir: ctx.cacheDir });
   }
   if (req.method === 'GET' && pathname === '/') {
     return sendIndexPage(res, ctx.svcId);

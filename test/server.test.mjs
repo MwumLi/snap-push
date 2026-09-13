@@ -691,10 +691,12 @@ describe('HTTP 基础接口', () => {
   let server;
   let base;
   let snapDir;
+  let cacheDir;
 
   before(async () => {
     snapDir = path.join(tmpRoot, 'shared');
-    ({ server, base } = await startServer({ snapDir }));
+    cacheDir = path.join(tmpRoot, 'shared-cache');
+    ({ server, base } = await startServer({ snapDir, cacheDir }));
   });
 
   after(async () => {
@@ -713,6 +715,8 @@ describe('HTTP 基础接口', () => {
     assert.equal(body.id.hostname, os.hostname());
     assert.equal(body.id.ip, undefined, '身份不应包含 ip');
     assert.ok(/^[0-9a-f]{8}$/.test(body.id.hash), `hash 应为 8 位 hex：${body.id.hash}`);
+    // 缓存目录应回显注入值，便于确认 SNAP_PUSH_CACHE_DIR 生效
+    assert.equal(body.cacheDir, cacheDir);
   });
 
   test('GET / → 200 占位 HTML（含 snap-push）', async () => {

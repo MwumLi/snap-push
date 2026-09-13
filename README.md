@@ -92,7 +92,7 @@ The local image library lives in `SNAP_PUSH_DIR` (default `~/snap-push`) and the
 | `POST` | `/api/history/batch` | Apply `{upserts, deletes}` atomically (reconciliation / bulk cleanup) |
 | `GET` | `/files/<name>` | Read a local-library file's bytes |
 | `DELETE` | `/files/<name>` | Delete a local-library file |
-| `GET` | `/health` | Health check and instance identity |
+| `GET` | `/health` | Health check, instance identity, and the effective cache dir |
 
 ## Architecture & Scenarios
 

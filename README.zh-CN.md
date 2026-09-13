@@ -92,7 +92,7 @@ node snap-push/server.mjs
 | `POST` | `/api/history/batch` | 原子应用 `{upserts, deletes}`（对账 / 批量清理用） |
 | `GET` | `/files/<name>` | 读取本机图库文件字节 |
 | `DELETE` | `/files/<name>` | 删除本机图库文件 |
-| `GET` | `/health` | 健康检查与实例标识 |
+| `GET` | `/health` | 健康检查、实例标识与生效的缓存目录 |
 
 ## 架构与场景
 
