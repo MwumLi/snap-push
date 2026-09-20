@@ -754,6 +754,19 @@ describe('HTTP 基础接口', () => {
     // 恢复不再有徽标，传输方式徽标也不再出现在图库卡片上
     assert.ok(!html.includes('badge-recovered'), '不应再引用 badge-recovered');
     assert.ok(!html.includes('badge-verified'), '不应再引用 badge-verified');
+    // 图库卡片下载：本机卡片与远端独有卡片各接一次下载按钮
+    assert.ok(html.includes('function triggerDownload'), '应含下载触发函数');
+    assert.ok(html.includes('function makeDownloadButton'), '应含下载按钮构造函数');
+    assert.ok(html.includes("b.textContent = '下载'"), '下载按钮文案应为“下载”');
+    assert.ok(html.includes('.card-ops { display: flex; justify-content: flex-end; gap: 8px; }'), '操作行应含按钮间距');
+    assert.ok(
+      html.includes("makeDownloadButton('/files/' + encodeURIComponent(f.name), nameOnTarget(f.name, srv))"),
+      '本机卡片应接入下载按钮'
+    );
+    assert.ok(
+      html.includes('makeDownloadButton(itemThumbUrl(item, srv), origFromName(item.name))'),
+      '远端独有卡片应接入下载按钮'
+    );
   });
 
   test('未知路径 → 404 + {ok:false} JSON', async () => {

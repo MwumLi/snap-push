@@ -712,7 +712,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .target-line { display: flex; align-items: center; margin-top: 3px; }
 .target-line code { flex: 1; }
 .target-none { color: #8b949e; }
-.card-ops { display: flex; justify-content: flex-end; }
+.card-ops { display: flex; justify-content: flex-end; gap: 8px; }
 .empty { color: #8b949e; }
 
 /* —— 卡片新增/删除动效（图库网格与同步抽屉共用）——
@@ -1096,6 +1096,25 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         setTimeout(function () { b.textContent = '复制'; b.disabled = false; }, 1200);
       });
     });
+    return b;
+  }
+
+  // 触发浏览器下载：同源 URL + download 指定保存名，不影响缩略图的新窗口预览
+  function triggerDownload(url, filename) {
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename || '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  // 下载按钮：点击把该图按原名保存到本地
+  function makeDownloadButton(url, filename) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = '下载';
+    b.addEventListener('click', function () { triggerDownload(url, filename); });
     return b;
   }
 
@@ -2063,6 +2082,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
+    // 下载：本机有字节，直接按当前目标的展示名保存
+    ops.appendChild(makeDownloadButton('/files/' + encodeURIComponent(f.name), nameOnTarget(f.name, srv)));
     var del = document.createElement('button');
     del.type = 'button';
     del.className = 'danger';
@@ -2135,6 +2156,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
+    // 下载：经 /api/remote-file 代理取回字节，保存名去 md5 前缀还原原名
+    ops.appendChild(makeDownloadButton(itemThumbUrl(item, srv), origFromName(item.name)));
     var del = document.createElement('button');
     del.type = 'button';
     del.className = 'danger';
