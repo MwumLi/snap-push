@@ -2158,7 +2158,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
   // 页面应内嵌图库批量选择/筛选工具条
   test('图库工具条含筛选/全选/批量删除控件', async () => {
     const html = await (await fetch(`${base}/`)).text();
-    ['galleryFilter', 'uniqueFilterWrap', 'filterUnique', 'uniqueFilterLabel', 'gallerySelInfo', 'gallerySelAll', 'galleryBatchDel']
+    ['galleryFilter', 'uniqueFilterWrap', 'filterUnique', 'uniqueFilterLabel', 'gallerySelInfo', 'gallerySelAll', 'galleryClearSel', 'galleryBatchDel']
       .forEach((id) => assert.ok(html.includes(`id="${id}"`), `页面应含 id="${id}"`));
     assert.ok(html.includes('makeGalleryCheck('), '应包含图库勾选框构建逻辑');
     assert.ok(html.includes('galleryBatchDelete'), '应包含批量删除逻辑');
@@ -2229,6 +2229,47 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     el = findNode(byId['histArea'], (n) => n.className === 'marquee');
     assert.equal(el.style.top, '100px', '滚动后上边仍固定在内容上');
     assert.equal(el.style.height, '150px', '滚动后下边随内容延伸（框变大）');
+  });
+
+  // 清空选择：有选择时才显示按钮；点击 / Esc 均可清空并隐藏按钮
+  test('图库：清空选择按钮按需显示，点击/Esc 清空', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const B = `${'b'.repeat(32)}-beta.png`;
+    const store = new Map();
+    const { doc, byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [
+              { name: A, size: 10, mtime: new Date().toISOString() },
+              { name: B, size: 20, mtime: new Date().toISOString() },
+            ] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(byId['galleryClearSel'].hidden, true, '无选择时「清空选择」应隐藏');
+
+    // 全选 → 按钮出现
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 2 张');
+    assert.equal(byId['galleryClearSel'].hidden, false, '有选择时「清空选择」应显示');
+
+    // 点击「清空选择」→ 清空并隐藏
+    byId['galleryClearSel']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '', '清空后无已选计数');
+    assert.equal(byId['galleryBatchDel'].textContent, '批量删除(0)');
+    assert.equal(byId['galleryBatchDel'].disabled, true, '清空后批量删除应置灰');
+    assert.equal(byId['galleryClearSel'].hidden, true, '清空后按钮应隐藏');
+
+    // 再全选后按 Esc → 同样清空并隐藏
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['galleryClearSel'].hidden, false);
+    doc._trigger('keydown', { key: 'Escape' });
+    assert.equal(byId['gallerySelInfo'].textContent, '', 'Esc 后无已选计数');
+    assert.equal(byId['galleryClearSel'].hidden, true, 'Esc 后按钮应隐藏');
   });
 
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选

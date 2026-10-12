@@ -921,6 +921,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       </label>
       <span class="gallery-selinfo" id="gallerySelInfo"></span>
       <button type="button" id="gallerySelAll" disabled>全选</button>
+      <button type="button" id="galleryClearSel" hidden>清空选择</button>
       <button type="button" id="galleryBatchDel" class="danger" disabled>批量删除</button>
     </div>
     <div class="hist-area" id="histArea">
@@ -1071,6 +1072,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var galleryFilter = ''; // 图库文件名筛选关键字（原始输入，匹配时转小写）
   var galleryOnlyUnique = false; // 图库「仅独有」筛选：本机目标=仅本机独有；服务器目标=仅远端独有
   var galleryBusy = false; // 图库批量删除进行中：锁定工具条与卡片勾选
+  var confirmActive = false; // 确认弹窗是否打开（供 Esc 快捷键避让）
   var galleryVisibleCache = []; // 最近一次渲染的可见卡片键（供勾选即时刷新工具条，免整页重渲染）
 
   // =============== DOM 引用 ===============
@@ -1104,6 +1106,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var uniqueFilterLabel = document.getElementById('uniqueFilterLabel');
   var gallerySelInfo = document.getElementById('gallerySelInfo');
   var gallerySelAll = document.getElementById('gallerySelAll');
+  var galleryClearSel = document.getElementById('galleryClearSel');
   var galleryBatchDel = document.getElementById('galleryBatchDel');
   var syncLibBtn = document.getElementById('syncLibBtn');
   var syncSourceSel = document.getElementById('syncSource');
@@ -2204,6 +2207,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       galleryVisibleCache.every(function (k) { return gallerySelected[k]; });
     gallerySelAll.textContent = allChecked ? '取消全选' : '全选';
     gallerySelAll.disabled = galleryBusy || galleryVisibleCache.length === 0;
+    // 「清空选择」仅在有选择时显示（批量删除进行中置灰）
+    galleryClearSel.hidden = selCount === 0;
+    galleryClearSel.disabled = galleryBusy;
     galleryBatchDel.textContent = '批量删除(' + selCount + ')';
     galleryBatchDel.disabled = galleryBusy || selCount === 0;
     // 勾选可用性随批量删除状态就地刷新（卡片被复用时不会重建）
@@ -2708,10 +2714,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       }
       confirmOk.textContent = opts.okText || '删除';
       confirmMask.hidden = false;
+      confirmActive = true;
       confirmOk.focus();
 
       function cleanup() {
         confirmMask.hidden = true;
+        confirmActive = false;
         confirmOk.removeEventListener('click', onOk);
         confirmCancel.removeEventListener('click', onCancel);
         document.removeEventListener('keydown', onKey);
@@ -3585,6 +3593,26 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     renderGrid(); // 重建卡片以反映勾选态（签名含勾选位）
   });
   galleryBatchDel.addEventListener('click', galleryBatchDelete);
+
+  // 清空选择：一键取消全部勾选（含被筛选隐藏的项）
+  function clearGallerySelection() {
+    if (galleryBusy) return;
+    if (gallerySelCount() === 0) return;
+    gallerySelected = {};
+    renderGrid(); // 重建卡片以反映勾选态（清空后「清空选择」按钮自动隐藏）
+  }
+  galleryClearSel.addEventListener('click', clearGallerySelection);
+
+  // Esc：优先取消进行中的画框；否则清空图库选择。
+  // 确认弹窗打开时避让（由弹窗自身处理 Esc）；焦点在输入控件时不干预。
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (confirmActive) return;
+    if (marquee.active) { endMarquee(false); return; }
+    var t = e.target;
+    if (t && t.tagName && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+    clearGallerySelection();
+  });
 
   // =============== 初始化 ===============
   // 用户切换目标：记住选择、按该目标过滤历史；切到服务器目标时异步探测+对账
