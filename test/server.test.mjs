@@ -22,6 +22,9 @@ import {
   isValidStoredName,
   isSafeSegment,
   isImageName,
+  rectsIntersect,
+  computeMarqueeKeys,
+  scrollStep,
   computeServiceId,
   serviceIdFrom,
   getOrCreateSecret,
@@ -239,6 +242,45 @@ describe('纯函数：isImageName', () => {
     assert.equal(isImageName('a.txt'), false);
     assert.equal(isImageName('README'), false);
     assert.equal(isImageName('a.png.bak'), false);
+  });
+});
+
+describe('纯函数：rectsIntersect / computeMarqueeKeys（画框选择）', () => {
+  const A = { left: 0, top: 0, right: 10, bottom: 10 };
+
+  test('rectsIntersect：相交 / 包含 / 相离 / 边界相接 / 空值', () => {
+    assert.ok(rectsIntersect(A, { left: 5, top: 5, right: 15, bottom: 15 }), '部分重叠');
+    assert.ok(rectsIntersect(A, { left: -5, top: -5, right: 5, bottom: 5 }), '反向重叠');
+    assert.ok(rectsIntersect(A, { left: 2, top: 2, right: 8, bottom: 8 }), '被包含');
+    assert.ok(rectsIntersect(A, { left: 10, top: 0, right: 20, bottom: 10 }), '边界相接算相交');
+    assert.ok(!rectsIntersect(A, { left: 11, top: 0, right: 20, bottom: 10 }), '右侧相离');
+    assert.ok(!rectsIntersect(A, { left: 0, top: 11, right: 10, bottom: 20 }), '下方相离');
+    assert.ok(!rectsIntersect(A, null), '空矩形');
+    assert.ok(!rectsIntersect(null, A), '空矩形');
+  });
+
+  test('computeMarqueeKeys：返回相交键并保持顺序，跳过无键/无矩形', () => {
+    const cards = [
+      { key: 'L:a', rect: { left: 0, top: 0, right: 10, bottom: 10 } },
+      { key: 'L:b', rect: { left: 100, top: 100, right: 110, bottom: 110 } },
+      { key: 'R:c', rect: { left: 5, top: 5, right: 15, bottom: 15 } },
+      { key: 'L:d', rect: null },
+      { rect: { left: 0, top: 0, right: 1, bottom: 1 } },
+    ];
+    const rect = { left: 0, top: 0, right: 12, bottom: 12 };
+    assert.deepEqual(computeMarqueeKeys(cards, rect), ['L:a', 'R:c']);
+    assert.deepEqual(computeMarqueeKeys(null, rect), []);
+  });
+});
+
+describe('纯函数：scrollStep（边缘自动滚动）', () => {
+  test('顶边 / 底边 / 中间分档', () => {
+    assert.deepEqual(scrollStep(400, 800, 40, 20), { dy: 0 }, '中间不滚动');
+    assert.deepEqual(scrollStep(0, 800, 40, 20), { dy: -20 }, '贴顶边最快向上');
+    assert.deepEqual(scrollStep(800, 800, 40, 20), { dy: 20 }, '贴底边最快向下');
+    assert.deepEqual(scrollStep(5, 800, 40, 20), { dy: -18 }, '接近顶边按比例');
+    assert.deepEqual(scrollStep(795, 800, 40, 20), { dy: 18 }, '接近底边按比例');
+    assert.deepEqual(scrollStep(40, 800, 40, 20), { dy: 0 }, '边界外不滚动');
   });
 });
 
@@ -2107,6 +2149,36 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       .forEach((id) => assert.ok(html.includes(`id="${id}"`), `页面应含 id="${id}"`));
     assert.ok(html.includes('makeGalleryCheck('), '应包含图库勾选框构建逻辑');
     assert.ok(html.includes('galleryBatchDelete'), '应包含批量删除逻辑');
+  });
+
+  // 画框选择：页面含相关代码；pointerdown 在垫片上不抛异常（含触摸应被忽略）
+  test('图库：画框选择代码存在且 pointerdown 安全', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.ok(html.includes('pointerdown'), '应含 pointerdown 监听');
+    assert.ok(html.includes("class = 'marquee'") || html.includes("className = 'marquee'"), '应含 marquee 元素创建');
+    assert.ok(html.includes('computeMarqueeKeys'), '应含画框命中计算');
+
+    const store = new Map();
+    const { byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library') ? { files: [] } : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    const grid = byId['grid'];
+    // 垫片无 getBoundingClientRect / setPointerCapture，处理器需安全降级、不抛异常
+    assert.doesNotThrow(() => {
+      grid._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+    }, '鼠标 pointerdown 不应抛异常');
+    assert.doesNotThrow(() => {
+      grid._trigger('pointerdown', { pointerType: 'touch', button: 0, pointerId: 2, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+    }, '触摸 pointerdown 不应抛异常（应被忽略）');
+    assert.doesNotThrow(() => {
+      grid._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 3, clientX: 0, clientY: 0, target: { tagName: 'IMG' }, preventDefault() {} });
+    }, '起点在卡片上不应启动画框，也不应抛异常');
   });
 
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选

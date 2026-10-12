@@ -247,6 +247,48 @@ export function isImageName(name) {
 }
 
 // =====================================================================
+// 一·四、图库画框选择：几何纯函数（页面内另有一份等价实现，此处供单测）
+// =====================================================================
+
+/**
+ * 两个矩形是否相交（边界相接也算）。矩形形如 {left, top, right, bottom}。
+ * 用于图库画框选择：卡片矩形与选择框矩形求交。
+ */
+export function rectsIntersect(a, b) {
+  if (!a || !b) return false;
+  return a.left <= b.right && b.left <= a.right && a.top <= b.bottom && b.top <= a.bottom;
+}
+
+/**
+ * 计算与选择框相交的卡片键。
+ * @param {Array<{key:string, rect:object}>} cards 每项含卡片键与视口矩形
+ * @param {{left:number,top:number,right:number,bottom:number}} rect 选择框矩形
+ * @returns {string[]} 相交的卡片键（保持输入顺序，跳过无键/无矩形的项）
+ */
+export function computeMarqueeKeys(cards, rect) {
+  const out = [];
+  (cards || []).forEach((c) => {
+    if (c && c.key && rectsIntersect(c.rect, rect)) out.push(c.key);
+  });
+  return out;
+}
+
+/**
+ * 边缘自动滚动步长：指针进入视口上/下 threshold 像素内时，按接近程度返回滚动增量 dy
+ * （向上为负、向下为正，幅度 0..maxStep）；不在边缘区内返回 0。
+ */
+export function scrollStep(pointerY, viewportH, threshold, maxStep) {
+  const t = threshold > 0 ? threshold : 1;
+  if (pointerY < t) {
+    return { dy: -Math.round(maxStep * ((t - pointerY) / t)) };
+  }
+  if (pointerY > viewportH - t) {
+    return { dy: Math.round(maxStep * ((pointerY - (viewportH - t)) / t)) };
+  }
+  return { dy: 0 };
+}
+
+// =====================================================================
 // 一·五、实例服务 ID：区分「都是 localhost 却指向不同机器」的场景
 // =====================================================================
 
@@ -747,6 +789,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .gallery-card .gallery-check { margin-right: auto; }
 /* 选中卡片高亮（inset 阴影不占布局，避免勾选时网格跳动） */
 .card.card-selected { border-color: #0969da; box-shadow: inset 0 0 0 1px #0969da; }
+/* —— 图库画框选择遮罩（挂在 .hist-area 下，pointer-events:none 不挡交互） —— */
+.marquee { position: absolute; z-index: 5; border: 1px solid #0969da; background: rgba(9, 105, 218, .12); pointer-events: none; }
+.marquee.subtract { border-color: #cf222e; background: rgba(207, 34, 46, .12); }
+/* 拖拽中禁止文本选择，避免出现蓝色选区 */
+.hist-area.marquee-on { user-select: none; -webkit-user-select: none; }
 
 /* —— 卡片新增/删除动效（图库网格与同步抽屉共用）——
    新增：从下滑入 + 淡入 + 模糊到清晰；删除：缩小 + 旋转滑出 + 淡出。
@@ -876,7 +923,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       <button type="button" id="gallerySelAll" disabled>全选</button>
       <button type="button" id="galleryBatchDel" class="danger" disabled>批量删除</button>
     </div>
-    <div class="hist-area">
+    <div class="hist-area" id="histArea">
       <div id="grid"></div>
       <aside id="syncDrawer">
         <header class="drawer-head">
@@ -1049,6 +1096,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var uploadResults = document.getElementById('uploadResults');
   var msg = document.getElementById('msg');
   var grid = document.getElementById('grid');
+  var histArea = document.getElementById('histArea');
   var historyCount = document.getElementById('historyCount');
   var galleryFilterEl = document.getElementById('galleryFilter');
   var uniqueFilterWrap = document.getElementById('uniqueFilterWrap');
@@ -2187,6 +2235,193 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     lab.appendChild(document.createTextNode('选择'));
     return lab;
   }
+
+  // =============== 图库画框选择（marquee）===============
+  // 在 #grid 空白处按下左键拖拽出矩形，松开后把相交卡片加入选择；按住 Alt 则移出选择。
+  // 仅鼠标/触控笔（pointerType !== 'touch'）；触摸屏保持原生滚动。
+  // 拖到视口上下边缘时自动滚动。几何逻辑与模块级导出版本（rectsIntersect 等）等价。
+
+  var MARQUEE_THRESHOLD = 4;    // 形成选择框的最小位移（px），区分单击
+  var MARQUEE_SCROLL_EDGE = 40; // 边缘自动滚动触发带（px）
+  var MARQUEE_SCROLL_MAX = 18;  // 单帧最大滚动步长（px）
+
+  var marquee = {
+    active: false, pointerId: null,
+    startX: 0, startY: 0, curX: 0, curY: 0,
+    el: null, subtract: false, raf: 0,
+  };
+
+  // 两矩形是否相交（边界相接也算）——与模块级 rectsIntersect 等价
+  function rectsIntersect(a, b) {
+    if (!a || !b) return false;
+    return a.left <= b.right && b.left <= a.right && a.top <= b.bottom && b.top <= a.bottom;
+  }
+
+  // 与选择框相交的卡片键——与模块级 computeMarqueeKeys 等价
+  function computeMarqueeKeys(cards, rect) {
+    var out = [];
+    (cards || []).forEach(function (c) {
+      if (c && c.key && rectsIntersect(c.rect, rect)) out.push(c.key);
+    });
+    return out;
+  }
+
+  // 边缘自动滚动步长——与模块级 scrollStep 等价
+  function scrollStep(pointerY, viewportH, threshold, maxStep) {
+    var t = threshold > 0 ? threshold : 1;
+    if (pointerY < t) return { dy: -Math.round(maxStep * ((t - pointerY) / t)) };
+    if (pointerY > viewportH - t) return { dy: Math.round(maxStep * ((pointerY - (viewportH - t)) / t)) };
+    return { dy: 0 };
+  }
+
+  // 选择框相对 .hist-area 的定位基准（无测量能力时退回 0）
+  function marqueeBox() {
+    if (histArea && typeof histArea.getBoundingClientRect === 'function') return histArea.getBoundingClientRect();
+    return { left: 0, top: 0 };
+  }
+
+  // 当前选择框的视口矩形
+  function marqueeRect() {
+    return {
+      left: Math.min(marquee.startX, marquee.curX),
+      top: Math.min(marquee.startY, marquee.curY),
+      right: Math.max(marquee.startX, marquee.curX),
+      bottom: Math.max(marquee.startY, marquee.curY),
+    };
+  }
+
+  // 按需创建/更新选择框元素（超过阈值才显示）
+  function updateMarqueeEl() {
+    var rect = marqueeRect();
+    var w = rect.right - rect.left;
+    var h = rect.bottom - rect.top;
+    if (!marquee.el && (w >= MARQUEE_THRESHOLD || h >= MARQUEE_THRESHOLD)) {
+      marquee.el = document.createElement('div');
+      marquee.el.className = 'marquee';
+      if (histArea && histArea.appendChild) histArea.appendChild(marquee.el);
+    }
+    if (marquee.el) {
+      var box = marqueeBox();
+      var cls = marquee.subtract ? 'marquee subtract' : 'marquee';
+      if (marquee.el.className !== cls) marquee.el.className = cls;
+      if (marquee.el.style) {
+        marquee.el.style.left = (rect.left - box.left) + 'px';
+        marquee.el.style.top = (rect.top - box.top) + 'px';
+        marquee.el.style.width = w + 'px';
+        marquee.el.style.height = h + 'px';
+      }
+    }
+    startMarqueeScroll();
+  }
+
+  function startMarqueeScroll() {
+    if (marquee.raf) return;
+    if (typeof requestAnimationFrame !== 'function') return; // 无 rAF（如测试垫片）不滚动
+    marquee.raf = requestAnimationFrame(tickMarqueeScroll);
+  }
+
+  function tickMarqueeScroll() {
+    marquee.raf = 0;
+    if (!marquee.active) return;
+    var vh = (window && window.innerHeight) || 0;
+    var st = scrollStep(marquee.curY, vh, MARQUEE_SCROLL_EDGE, MARQUEE_SCROLL_MAX);
+    if (!st.dy) return; // 不在边缘：停，等下次 pointermove 再启动
+    if (window && typeof window.scrollBy === 'function') window.scrollBy(0, st.dy);
+    updateMarqueeEl(); // 重定位并继续调度
+  }
+
+  // 应用画框结果：把 keys 加入（或 subtract 时移出）选择，就地刷新卡片与工具条
+  function applyMarqueeSelection(keys, subtract) {
+    if (!keys || !keys.length) return;
+    var changed = false;
+    keys.forEach(function (k) {
+      if (subtract) { if (gallerySelected[k]) { delete gallerySelected[k]; changed = true; } }
+      else if (!gallerySelected[k]) { gallerySelected[k] = true; changed = true; }
+    });
+    if (!changed) return;
+    var byKey = {};
+    (prevCards.grid || []).forEach(function (c) { if (c && c.key) byKey[c.key] = c.el; });
+    keys.forEach(function (k) {
+      var el = byKey[k];
+      if (!el) return;
+      var on = !!gallerySelected[k];
+      if (el._check) el._check.checked = on;
+      if (typeof el.className === 'string') {
+        var has = el.className.indexOf('card-selected') >= 0;
+        if (on && !has) el.className += ' card-selected';
+        else if (!on && has) el.className = el.className.replace(' card-selected', '');
+      }
+    });
+    updateGalleryToolbarLight();
+  }
+
+  function endMarquee(apply) {
+    if (!marquee.active) return;
+    marquee.active = false;
+    if (marquee.raf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(marquee.raf);
+    marquee.raf = 0;
+    if (marquee.el && marquee.el.parentNode && marquee.el.parentNode.removeChild) {
+      marquee.el.parentNode.removeChild(marquee.el);
+    }
+    marquee.el = null;
+    if (histArea && histArea.classList && histArea.classList.remove) histArea.classList.remove('marquee-on');
+    if (marquee.pointerId != null && grid && typeof grid.releasePointerCapture === 'function') {
+      try { grid.releasePointerCapture(marquee.pointerId); } catch (err) { /* 忽略 */ }
+    }
+    marquee.pointerId = null;
+    if (!apply) return;
+    var rect = marqueeRect();
+    if (rect.right - rect.left < MARQUEE_THRESHOLD && rect.bottom - rect.top < MARQUEE_THRESHOLD) return; // 未形成有效框
+    var cards = [];
+    (prevCards.grid || []).forEach(function (c) {
+      if (!c || !c.key || !c.el) return;
+      var k0 = c.key.charAt(0);
+      if (k0 !== 'L' && k0 !== 'R') return; // 跳过 @empty 等占位节点
+      if (typeof c.el.getBoundingClientRect !== 'function') return;
+      var r = c.el.getBoundingClientRect();
+      cards.push({ key: c.key, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } });
+    });
+    applyMarqueeSelection(computeMarqueeKeys(cards, rect), marquee.subtract);
+  }
+
+  // 起点：仅 #grid 空白/间隙、左键、非触摸、非批量删除中
+  grid.addEventListener('pointerdown', function (e) {
+    if (galleryBusy) return;
+    if (e.pointerType === 'touch') return; // 触摸屏不画框（保持原生滚动）
+    if (e.button !== 0) return;            // 仅左键
+    if (e.target !== grid) return;         // 起点落在卡片/控件上则不启动
+    marquee.active = true;
+    marquee.pointerId = e.pointerId;
+    marquee.subtract = !!e.altKey;
+    marquee.startX = marquee.curX = e.clientX;
+    marquee.startY = marquee.curY = e.clientY;
+    marquee.el = null;
+    if (histArea && histArea.classList && histArea.classList.add) histArea.classList.add('marquee-on');
+    if (grid && typeof grid.setPointerCapture === 'function' && e.pointerId != null) {
+      try { grid.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+    }
+    if (typeof e.preventDefault === 'function') e.preventDefault();
+  });
+
+  document.addEventListener('pointermove', function (e) {
+    if (!marquee.active || e.pointerId !== marquee.pointerId) return;
+    marquee.curX = e.clientX;
+    marquee.curY = e.clientY;
+    marquee.subtract = !!e.altKey;
+    updateMarqueeEl();
+  });
+
+  document.addEventListener('pointerup', function (e) {
+    if (!marquee.active || e.pointerId !== marquee.pointerId) return;
+    marquee.curX = e.clientX;
+    marquee.curY = e.clientY;
+    endMarquee(true);
+  });
+
+  document.addEventListener('pointercancel', function (e) {
+    if (!marquee.active || e.pointerId !== marquee.pointerId) return;
+    endMarquee(false);
+  });
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
   function refreshSyncArea() {
