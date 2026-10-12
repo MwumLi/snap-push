@@ -2247,7 +2247,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   var marquee = {
     active: false, pointerId: null,
-    startX: 0, startY: 0, curX: 0, curY: 0,
+    ax: 0, ay: 0,   // 起点：相对 .hist-area（文档稳定，滚动时不变）
+    cx: 0, cy: 0,   // 当前边：相对 .hist-area，每次移动/滚动按当前矩形重算
+    clientY: 0,     // 最近一次指针视口 Y（供边缘自动滚动判定）
     el: null, subtract: false, raf: 0,
   };
 
@@ -2280,19 +2282,35 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return { left: 0, top: 0 };
   }
 
-  // 当前选择框的视口矩形
-  function marqueeRect() {
+  // 把指针视口坐标换算成相对 .hist-area 的坐标（文档稳定：滚动时同一点得到相同值）
+  function marqueeRel(e) {
+    var box = marqueeBox();
+    return { x: e.clientX - box.left, y: e.clientY - box.top };
+  }
+
+  // 当前选择框矩形（相对 .hist-area，文档稳定系）
+  function marqueeRelRect() {
     return {
-      left: Math.min(marquee.startX, marquee.curX),
-      top: Math.min(marquee.startY, marquee.curY),
-      right: Math.max(marquee.startX, marquee.curX),
-      bottom: Math.max(marquee.startY, marquee.curY),
+      left: Math.min(marquee.ax, marquee.cx),
+      top: Math.min(marquee.ay, marquee.cy),
+      right: Math.max(marquee.ax, marquee.cx),
+      bottom: Math.max(marquee.ay, marquee.cy),
+    };
+  }
+
+  // 选择框的视口矩形（供与卡片 getBoundingClientRect 做相交检测）
+  function marqueeViewportRect() {
+    var r = marqueeRelRect();
+    var box = marqueeBox();
+    return {
+      left: r.left + box.left, top: r.top + box.top,
+      right: r.right + box.left, bottom: r.bottom + box.top,
     };
   }
 
   // 按需创建/更新选择框元素（超过阈值才显示）
   function updateMarqueeEl() {
-    var rect = marqueeRect();
+    var rect = marqueeRelRect();
     var w = rect.right - rect.left;
     var h = rect.bottom - rect.top;
     if (!marquee.el && (w >= MARQUEE_THRESHOLD || h >= MARQUEE_THRESHOLD)) {
@@ -2301,12 +2319,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (histArea && histArea.appendChild) histArea.appendChild(marquee.el);
     }
     if (marquee.el) {
-      var box = marqueeBox();
       var cls = marquee.subtract ? 'marquee subtract' : 'marquee';
       if (marquee.el.className !== cls) marquee.el.className = cls;
       if (marquee.el.style) {
-        marquee.el.style.left = (rect.left - box.left) + 'px';
-        marquee.el.style.top = (rect.top - box.top) + 'px';
+        marquee.el.style.left = rect.left + 'px';
+        marquee.el.style.top = rect.top + 'px';
         marquee.el.style.width = w + 'px';
         marquee.el.style.height = h + 'px';
       }
@@ -2324,10 +2341,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     marquee.raf = 0;
     if (!marquee.active) return;
     var vh = (window && window.innerHeight) || 0;
-    var st = scrollStep(marquee.curY, vh, MARQUEE_SCROLL_EDGE, MARQUEE_SCROLL_MAX);
+    var st = scrollStep(marquee.clientY, vh, MARQUEE_SCROLL_EDGE, MARQUEE_SCROLL_MAX);
     if (!st.dy) return; // 不在边缘：停，等下次 pointermove 再启动
     if (window && typeof window.scrollBy === 'function') window.scrollBy(0, st.dy);
-    updateMarqueeEl(); // 重定位并继续调度
+    updateMarqueeEl(); // 重定位（框随内容延伸）并继续调度
   }
 
   // 应用画框结果：把 keys 加入（或 subtract 时移出）选择，就地刷新卡片与工具条
@@ -2370,8 +2387,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     }
     marquee.pointerId = null;
     if (!apply) return;
-    var rect = marqueeRect();
-    if (rect.right - rect.left < MARQUEE_THRESHOLD && rect.bottom - rect.top < MARQUEE_THRESHOLD) return; // 未形成有效框
+    var rel = marqueeRelRect();
+    if (rel.right - rel.left < MARQUEE_THRESHOLD && rel.bottom - rel.top < MARQUEE_THRESHOLD) return; // 未形成有效框
+    var rect = marqueeViewportRect(); // 转成视口矩形与卡片矩形做相交
     var cards = [];
     (prevCards.grid || []).forEach(function (c) {
       if (!c || !c.key || !c.el) return;
@@ -2420,8 +2438,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     marquee.active = true;
     marquee.pointerId = e.pointerId;
     marquee.subtract = !!e.altKey;
-    marquee.startX = marquee.curX = e.clientX;
-    marquee.startY = marquee.curY = e.clientY;
+    var p0 = marqueeRel(e);
+    marquee.ax = marquee.cx = p0.x;
+    marquee.ay = marquee.cy = p0.y;
+    marquee.clientY = e.clientY;
     marquee.el = null;
     if (histArea && histArea.classList && histArea.classList.add) histArea.classList.add('marquee-on');
     if (grid && typeof grid.setPointerCapture === 'function' && e.pointerId != null) {
@@ -2432,16 +2452,19 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
   document.addEventListener('pointermove', function (e) {
     if (!marquee.active || e.pointerId !== marquee.pointerId) return;
-    marquee.curX = e.clientX;
-    marquee.curY = e.clientY;
+    var p = marqueeRel(e);
+    marquee.cx = p.x;
+    marquee.cy = p.y;
+    marquee.clientY = e.clientY;
     marquee.subtract = !!e.altKey;
     updateMarqueeEl();
   });
 
   document.addEventListener('pointerup', function (e) {
     if (!marquee.active || e.pointerId !== marquee.pointerId) return;
-    marquee.curX = e.clientX;
-    marquee.curY = e.clientY;
+    var p = marqueeRel(e);
+    marquee.cx = p.x;
+    marquee.cy = p.y;
     endMarquee(true);
   });
 

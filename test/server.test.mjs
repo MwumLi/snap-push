@@ -2198,6 +2198,39 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     }, '起点在卡片（IMG）上不应抛异常');
   });
 
+  // 回归：自动滚动时框应随内容延伸（上边固定在内容上、下边随滚动变大），而不是整体跟着滚。
+  // 用可变的 histArea 视口矩形模拟页面滚动（top 变小）。
+  test('图库：画框随页面滚动延伸（坐标用文档稳定系）', async () => {
+    const store = new Map();
+    const { doc, byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library') ? { files: [] } : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    let scrollY = 0;
+    // 模拟 .hist-area 随页面滚动上移：视口 top 变小、bottom 同步上移
+    byId['histArea'].getBoundingClientRect = () => ({ left: 0, top: -scrollY, right: 1000, bottom: 1000 - scrollY });
+    const grid = byId['grid'];
+
+    doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 100, clientY: 100, target: grid, preventDefault() {} });
+    doc._trigger('pointermove', { pointerId: 1, clientX: 100, clientY: 200, altKey: false });
+    let el = findNode(byId['histArea'], (n) => n.className === 'marquee');
+    assert.ok(el, '应创建选择框元素');
+    assert.equal(el.style.top, '100px', '上边固定在起点');
+    assert.equal(el.style.height, '100px', '初始高度 100');
+
+    // 模拟自动滚动：内容上移 50，指针视口位置不变 → 下边应随内容延伸
+    scrollY = 50;
+    doc._trigger('pointermove', { pointerId: 1, clientX: 100, clientY: 200, altKey: false });
+    el = findNode(byId['histArea'], (n) => n.className === 'marquee');
+    assert.equal(el.style.top, '100px', '滚动后上边仍固定在内容上');
+    assert.equal(el.style.height, '150px', '滚动后下边随内容延伸（框变大）');
+  });
+
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选
   test('图库：勾选 / 全选仅作用于可见卡片 / 关键字筛选', async () => {
     const A = `${'a'.repeat(32)}-alpha.png`;
