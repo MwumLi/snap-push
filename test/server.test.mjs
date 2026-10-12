@@ -1952,6 +1952,245 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     assert.equal(deleteCalled, false, '探测在途时点击删除不应发起请求');
     assert.equal((byId['confirmOk']._listeners.click || []).length, 0, '探测在途时不应弹出确认框');
   });
+
+  // 收集 mock 节点树里满足条件的全部节点（供断言勾选框等）
+  function collectNodes(node, pred, out) {
+    out = out || [];
+    if (!node) return out;
+    if (pred(node)) out.push(node);
+    for (const c of node._children || []) collectNodes(c, pred, out);
+    return out;
+  }
+
+  // 图库网格里的勾选框（type=checkbox）
+  function galleryChecks(root) {
+    return collectNodes(root, (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+  }
+
+  // 取页面内嵌脚本并注入垫片运行；返回 byId 供测试定位控件
+  async function bootPage(opts) {
+    const html = await (await fetch(`${base}/`)).text();
+    const m = /<script>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(m, '应能提取内嵌 <script>');
+    const byId = {};
+    const documentShim = makeDocumentShim(byId);
+    const localStorageShim = {
+      getItem(k) { return opts.store.has(k) ? opts.store.get(k) : null; },
+      setItem(k, v) { opts.store.set(k, String(v)); },
+    };
+    const windowShim = { confirm() { return true; }, alert() {} };
+    const fetchShim = withStateFetch(opts.fetchImpl, { servers: opts.servers || [], history: opts.history || {} });
+    // eslint-disable-next-line no-new-func
+    new Function(
+      'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
+      'setTimeout', 'clearTimeout', m[1],
+    )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
+    return { byId };
+  }
+
+  // 页面应内嵌图库批量选择/筛选工具条
+  test('图库工具条含筛选/全选/批量删除控件', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    ['galleryFilter', 'remoteOnlyWrap', 'filterRemoteOnly', 'gallerySelInfo', 'gallerySelAll', 'galleryBatchDel']
+      .forEach((id) => assert.ok(html.includes(`id="${id}"`), `页面应含 id="${id}"`));
+    assert.ok(html.includes('makeGalleryCheck('), '应包含图库勾选框构建逻辑');
+    assert.ok(html.includes('galleryBatchDelete'), '应包含批量删除逻辑');
+  });
+
+  // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选
+  test('图库：勾选 / 全选仅作用于可见卡片 / 关键字筛选', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const B = `${'b'.repeat(32)}-beta.png`;
+    const store = new Map();
+    const { byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [
+              { name: A, size: 10, mtime: new Date().toISOString() },
+              { name: B, size: 20, mtime: new Date().toISOString() },
+            ] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    assert.equal(galleryChecks(grid).length, 2, '应有 2 个勾选框');
+
+    // 关键字筛选：只剩 alpha
+    byId['galleryFilter'].value = 'alpha';
+    byId['galleryFilter']._trigger('input');
+    assert.ok(hasText(grid, 'alpha.png'), '应保留 alpha');
+    assert.ok(!hasText(grid, 'beta.png'), '应过滤掉 beta');
+
+    // 全选只勾选可见（alpha）
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 1 张', '全选应只勾选可见的 1 张');
+    assert.equal(byId['galleryBatchDel'].textContent, '批量删除(1)');
+
+    // 清除筛选：两张都在，但仅 alpha 处于勾选态
+    byId['galleryFilter'].value = '';
+    byId['galleryFilter']._trigger('input');
+    assert.equal(galleryChecks(grid).length, 2, '清除筛选后应恢复 2 张');
+    assert.equal(galleryChecks(grid).filter((c) => c.checked).length, 1, '仅 alpha 应保持勾选');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 1 张');
+  });
+
+  // 服务器目标：仅远端独有筛选 + 对筛选结果全选
+  test('图库：仅远端独有筛选 + 全选', async () => {
+    const LOCAL = `${HEX32}-local.png`;
+    const REMOTE = `${'f'.repeat(32)}-remote.png`;
+    const REMOTE_MD5 = 'f'.repeat(32);
+    const store = new Map();
+    store.set('snap-push.target', JSON.stringify('s1'));
+    const servers = [{ id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' }];
+    const history = {
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    };
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      '127.0.0.1|/tmp/x': {
+        fetchedAt: Date.now(),
+        files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE, md5: REMOTE_MD5 }],
+      },
+    }));
+    const { byId } = await bootPage({
+      store, servers, history,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        let body;
+        if (u.includes('/api/library')) {
+          body = { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] };
+        } else if (u.includes('/api/remote')) {
+          body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE, md5: REMOTE_MD5 }] };
+        } else {
+          body = { ok: true };
+        }
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    assert.equal(byId['remoteOnlyWrap'].hidden, false, '服务器目标应显示「仅远端独有」开关');
+    assert.ok(hasText(grid, 'local.png') && hasText(grid, 'remote.png'), '应同时渲染本地与远端独有卡片');
+
+    byId['filterRemoteOnly'].checked = true;
+    byId['filterRemoteOnly']._trigger('change');
+    assert.ok(!hasText(grid, 'local.png'), '仅远端独有：本地卡片应隐藏');
+    assert.ok(hasText(grid, 'remote.png'), '仅远端独有：远端独有卡片应保留');
+
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 1 张', '全选应只勾选远端独有卡片');
+  });
+
+  // 服务器目标：批量删除选中项（本地卡片 + 远端独有卡片）→ 逐个 DELETE /api/remote-file
+  test('图库：服务器目标批量删除选中项', async () => {
+    const LOCAL = `${HEX32}-local.png`;
+    const REMOTE = `${'f'.repeat(32)}-remote.png`;
+    const REMOTE_MD5 = 'f'.repeat(32);
+    const store = new Map();
+    store.set('snap-push.target', JSON.stringify('s1'));
+    const servers = [{ id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' }];
+    const history = {
+      [LOCAL]: {
+        orig: 'local.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: LOCAL, remotePath: `/tmp/x/${LOCAL}`,
+          method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+    };
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      '127.0.0.1|/tmp/x': {
+        fetchedAt: Date.now(),
+        files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE, md5: REMOTE_MD5 }],
+      },
+    }));
+    const remoteDeletes = [];
+    const { byId } = await bootPage({
+      store, servers, history,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || 'GET';
+        if (method === 'DELETE' && u.includes('/api/remote-file')) {
+          remoteDeletes.push(u);
+          return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        }
+        let body;
+        if (u.includes('/api/library')) {
+          body = { files: [{ name: LOCAL, size: 10, mtime: new Date().toISOString() }] };
+        } else if (u.includes('/api/remote')) {
+          body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: LOCAL, md5: HEX32 }, { name: REMOTE, md5: REMOTE_MD5 }] };
+        } else {
+          body = { ok: true };
+        }
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+
+    byId['gallerySelAll']._trigger('click'); // 选中本地 + 远端独有共 2 张
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 2 张');
+    byId['galleryBatchDel']._trigger('click'); // 弹确认
+    byId['confirmOk']._trigger('click'); // 确认
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(remoteDeletes.length, 2, '应对两个选中项各发起一次远端删除');
+    assert.ok(!hasText(grid, 'local.png') && !hasText(grid, 'remote.png'), '删除后两张卡片应消失');
+  });
+
+  // 本机目标：批量删除选中项 → 逐个 DELETE /files/<name>
+  test('图库：本机目标批量删除选中项', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const B = `${'b'.repeat(32)}-beta.png`;
+    const store = new Map();
+    const deleted = new Set(); // 删除后 /api/library 动态移除，模拟真实磁盘
+    const fileDeletes = [];
+    const { byId } = await bootPage({
+      store,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || 'GET';
+        if (method === 'DELETE' && u.includes('/files/')) {
+          fileDeletes.push(u);
+          deleted.add(decodeURIComponent(u.split('/files/')[1]));
+          return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        }
+        let body;
+        if (u.includes('/api/library')) {
+          body = { files: [
+            { name: A, size: 10, mtime: new Date().toISOString() },
+            { name: B, size: 20, mtime: new Date().toISOString() },
+          ].filter((f) => !deleted.has(f.name)) };
+        } else {
+          body = { ok: true };
+        }
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 2 张');
+    byId['galleryBatchDel']._trigger('click');
+    byId['confirmOk']._trigger('click');
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(fileDeletes.length, 2, '应对两个本地文件各发起一次删除');
+    assert.ok(fileDeletes.every((u) => u.includes('/files/')), '应调用 /files/<name>');
+    assert.ok(!hasText(grid, 'alpha.png') && !hasText(grid, 'beta.png'), '删除后两张卡片应消失');
+  });
 });
 
 const e2eEnabled = process.env.SNAP_PUSH_E2E === '1';

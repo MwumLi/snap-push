@@ -715,6 +715,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .card-ops { display: flex; justify-content: flex-end; gap: 8px; }
 .empty { color: #8b949e; }
 
+/* —— 图库工具条：文件名筛选 + 仅远端独有 + 全选 + 批量删除 —— */
+.gallery-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
+.gallery-bar input[type=search] { font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; width: 220px; }
+.gallery-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.gallery-selinfo { margin-left: auto; font-size: 12px; color: #57606a; }
+/* 图库卡片操作行：左侧勾选（auto 边距顶到最左）、右侧操作按钮成组靠右 */
+.gallery-card .card-ops { align-items: center; }
+.gallery-card .gallery-check { margin-right: auto; }
+/* 选中卡片高亮（inset 阴影不占布局，避免勾选时网格跳动） */
+.card.card-selected { border-color: #0969da; box-shadow: inset 0 0 0 1px #0969da; }
+
 /* —— 卡片新增/删除动效（图库网格与同步抽屉共用）——
    新增：从下滑入 + 淡入 + 模糊到清晰；删除：缩小 + 旋转滑出 + 淡出。
    交错延迟由页面按序号写入 animation-delay；入场用 backwards，动画结束后不残留 filter 图层。 */
@@ -755,7 +766,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 /* 抽屉内缺项 = 历史卡片样式，仅单列铺满抽屉宽；flex:0 0 auto 防止条目过多时被压缩（否则操作行被裁且不触发滚动） */
 .sync-card { width: 100%; flex: 0 0 auto; }
 .sync-card .card-ops { justify-content: space-between; align-items: center; margin-top: 2px; }
-.sync-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.sync-check, .gallery-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
 .sync-err { color: #cf222e; font-size: 11px; word-break: break-all; line-height: 1.4; }
 .drawer-foot { display: flex; align-items: center; gap: 6px; justify-content: space-between; padding: 8px 10px; border-top: 1px solid #f0f2f4; }
 .drawer-foot .sync-progress { color: #57606a; font-size: 12px; }
@@ -832,6 +843,16 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <h2>图库 <span class="count" id="historyCount"></span>
       <button type="button" id="cleanStaleBtn" hidden>清理失效记录</button>
     </h2>
+    <!-- 图库工具条：文件名筛选 + 仅远端独有（仅服务器目标）+ 全选 + 批量删除 -->
+    <div class="gallery-bar">
+      <input type="search" id="galleryFilter" placeholder="筛选文件名…" autocomplete="off" aria-label="按文件名筛选">
+      <label class="gallery-toggle" id="remoteOnlyWrap" hidden>
+        <input type="checkbox" id="filterRemoteOnly">仅远端独有
+      </label>
+      <span class="gallery-selinfo" id="gallerySelInfo"></span>
+      <button type="button" id="gallerySelAll" disabled>全选</button>
+      <button type="button" id="galleryBatchDel" class="danger" disabled>批量删除</button>
+    </div>
     <div class="hist-area">
       <div id="grid"></div>
       <aside id="syncDrawer">
@@ -976,6 +997,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var PROBE_TTL_MS = 30000; // 探测结果缓存有效期：期间切换目标直接复用，手动「重新对账」可强制刷新
   var syncSelected = {}; // 「从图库补齐」抽屉的勾选集合：localName -> true
   var syncBusy = false; // 同步进行中：期间禁用勾选/按钮，避免交叉
+  var gallerySelected = {}; // 图库勾选集合：键 -> true，键 = 'L:<本地名>' | 'R:<远端名>'
+  var galleryFilter = ''; // 图库文件名筛选关键字（原始输入，匹配时转小写）
+  var galleryRemoteOnly = false; // 图库「仅远端独有」筛选（仅服务器目标有意义）
+  var galleryBusy = false; // 图库批量删除进行中：锁定工具条与卡片勾选
+  var galleryVisibleCache = []; // 最近一次渲染的可见卡片键（供勾选即时刷新工具条，免整页重渲染）
 
   // =============== DOM 引用 ===============
   var targetSel = document.getElementById('targetSel');
@@ -1001,6 +1027,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var msg = document.getElementById('msg');
   var grid = document.getElementById('grid');
   var historyCount = document.getElementById('historyCount');
+  var galleryFilterEl = document.getElementById('galleryFilter');
+  var remoteOnlyWrap = document.getElementById('remoteOnlyWrap');
+  var filterRemoteOnlyEl = document.getElementById('filterRemoteOnly');
+  var gallerySelInfo = document.getElementById('gallerySelInfo');
+  var gallerySelAll = document.getElementById('gallerySelAll');
+  var galleryBatchDel = document.getElementById('galleryBatchDel');
   var syncLibBtn = document.getElementById('syncLibBtn');
   var syncSourceSel = document.getElementById('syncSource');
   var syncDrawer = document.getElementById('syncDrawer');
@@ -1932,12 +1964,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         }).join('|')
       : '';
     return ['L', f.name, f.size, f.mtime, nameOnTarget(f.name, srv),
-      srv ? (srv.label || srv.host) : '', records].join('\u0001');
+      srv ? (srv.label || srv.host) : '', records,
+      gallerySelected['L:' + f.name] ? 1 : 0].join('\u0001');
   }
 
   // 远端独有卡片的内容签名
   function remoteCardSig(item, srv) {
-    return ['R', item.name, item.md5 || '', srv.label || srv.host, srv.dir].join('\u0001');
+    return ['R', item.name, item.md5 || '', srv.label || srv.host, srv.dir,
+      gallerySelected['R:' + item.name] ? 1 : 0].join('\u0001');
   }
 
   // 同步抽屉条目的内容签名（来源 / 目标 / 勾选 / 忙碌状态 / 本地副本变化都会触发重建）
@@ -1981,31 +2015,52 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       }
     }
 
+    // —— 筛选：仅远端独有（仅服务器目标）+ 文件名关键字 ——
+    // 本地卡片按「当前目标下的展示名」匹配，远端独有卡片按去掉 md5 前缀的原名匹配。
+    var kw = galleryFilter.trim().toLowerCase();
+    var onlyRemote = galleryRemoteOnly && !!srv;
+    var visibleLocals = onlyRemote ? [] : locals.filter(function (f) {
+      return !kw || nameOnTarget(f.name, srv).toLowerCase().indexOf(kw) >= 0;
+    });
+    var visibleRemotes = remotes.filter(function (f) {
+      return !kw || origFromName(f.name).toLowerCase().indexOf(kw) >= 0;
+    });
+
+    // 剪枝：只保留仍存在于图库（本地 ∪ 远端独有全集）的勾选键，避免刷新后残留
+    var existing = {};
+    locals.forEach(function (f) { existing['L:' + f.name] = true; });
+    remotes.forEach(function (f) { existing['R:' + f.name] = true; });
+    Object.keys(gallerySelected).forEach(function (k) { if (!existing[k]) delete gallerySelected[k]; });
+
     var total = locals.length + remotes.length;
-    historyCount.textContent = srv
-      ? total + ' 张 · ' + (srv.label || srv.host)
-      : total + ' 张';
+    var shown = visibleLocals.length + visibleRemotes.length;
+    var countText = (shown === total) ? (total + ' 张') : (shown + ' / ' + total + ' 张');
+    historyCount.textContent = srv ? countText + ' · ' + (srv.label || srv.host) : countText;
+
+    renderGalleryToolbar(visibleLocals, visibleRemotes, srv);
 
     // 组装期望卡片：本地在前、远端独有在后；空列表用占位节点参与对账
     var entries = [];
-    locals.forEach(function (f) {
+    visibleLocals.forEach(function (f) {
       entries.push({
         key: 'L:' + f.name,
         sig: localCardSig(f, srv),
         build: function (isNew) { return makeCard(f, srv, isNew); },
       });
     });
-    remotes.forEach(function (f) {
+    visibleRemotes.forEach(function (f) {
       entries.push({
         key: 'R:' + f.name,
         sig: remoteCardSig(f, srv),
         build: function (isNew) { return makeRemoteCard(f, srv, isNew); },
       });
     });
-    if (!total) {
-      var emptyText = srv
-        ? '该目标下还没有图片：选择图片上传即会推送到 ' + (srv.label || srv.host)
-        : '还没有图片：粘贴截图 / 拖拽 / 选择文件上传';
+    if (!shown) {
+      var emptyText = total
+        ? '没有匹配筛选条件的图片（共 ' + total + ' 张）'
+        : (srv
+          ? '该目标下还没有图片：选择图片上传即会推送到 ' + (srv.label || srv.host)
+          : '还没有图片：粘贴截图 / 拖拽 / 选择文件上传');
       entries.push({
         key: '@empty',
         sig: 'empty:' + emptyText,
@@ -2018,11 +2073,83 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       });
     }
     reconcileCards(grid, 'grid', entries);
-    // 探测在途状态不参与签名（否则每次探测起止都重建卡片）：就地刷新删除按钮置灰
+    // 探测在途状态不参与签名（否则每次探测起止都重建卡片）：就地刷新删除/勾选按钮可用性
     var busy = !!(srv && probeBusy[targetKey(srv)]);
     (prevCards.grid || []).forEach(function (c) {
-      if (c.el && c.el._delBtn) c.el._delBtn.disabled = busy;
+      if (!c.el) return;
+      if (c.el._delBtn) c.el._delBtn.disabled = busy;
+      if (c.el._check) c.el._check.disabled = galleryBusy;
     });
+  }
+
+  // 当前可见（筛选后）卡片的键集合
+  function galleryVisibleKeys(visibleLocals, visibleRemotes) {
+    var keys = [];
+    visibleLocals.forEach(function (f) { keys.push('L:' + f.name); });
+    visibleRemotes.forEach(function (f) { keys.push('R:' + f.name); });
+    return keys;
+  }
+
+  // 已勾选数量
+  function gallerySelCount() {
+    var n = 0;
+    for (var k in gallerySelected) { if (gallerySelected[k]) n++; }
+    return n;
+  }
+
+  // 图库工具条刷新：远端独有开关显隐 + 可见键缓存 + 计数/按钮
+  function renderGalleryToolbar(visibleLocals, visibleRemotes, srv) {
+    // 「仅远端独有」仅服务器目标可用；切到本机时隐藏并复位
+    if (srv) {
+      remoteOnlyWrap.hidden = false;
+      filterRemoteOnlyEl.checked = galleryRemoteOnly;
+    } else {
+      remoteOnlyWrap.hidden = true;
+      galleryRemoteOnly = false;
+      filterRemoteOnlyEl.checked = false;
+    }
+    galleryVisibleCache = galleryVisibleKeys(visibleLocals, visibleRemotes);
+    updateGalleryToolbarLight();
+  }
+
+  // 只按「已选集合 + 可见键缓存」刷新计数与按钮，不重建卡片（勾选/取消勾选时用）
+  function updateGalleryToolbarLight() {
+    var selCount = gallerySelCount();
+    gallerySelInfo.textContent = selCount ? ('已选 ' + selCount + ' 张') : '';
+    var allChecked = galleryVisibleCache.length > 0 &&
+      galleryVisibleCache.every(function (k) { return gallerySelected[k]; });
+    gallerySelAll.textContent = allChecked ? '取消全选' : '全选';
+    gallerySelAll.disabled = galleryBusy || galleryVisibleCache.length === 0;
+    galleryBatchDel.textContent = '批量删除(' + selCount + ')';
+    galleryBatchDel.disabled = galleryBusy || selCount === 0;
+    // 勾选可用性随批量删除状态就地刷新（卡片被复用时不会重建）
+    (prevCards.grid || []).forEach(function (c) {
+      if (c.el && c.el._check) c.el._check.disabled = galleryBusy;
+    });
+  }
+
+  // 图库卡片勾选框：更新 gallerySelected、切换卡片高亮、即时刷新工具条
+  function makeGalleryCheck(key, card) {
+    var lab = document.createElement('label');
+    lab.className = 'gallery-check';
+    var check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = !!gallerySelected[key];
+    check.disabled = galleryBusy;
+    check.addEventListener('change', function () {
+      if (check.checked) gallerySelected[key] = true;
+      else delete gallerySelected[key];
+      if (card && typeof card.className === 'string') {
+        var has = card.className.indexOf('card-selected') >= 0;
+        if (check.checked && !has) card.className += ' card-selected';
+        else if (!check.checked && has) card.className = card.className.replace(' card-selected', '');
+      }
+      updateGalleryToolbarLight();
+    });
+    card._check = check; // 复用卡片时就地刷新勾选可用性
+    lab.appendChild(check);
+    lab.appendChild(document.createTextNode('选择'));
+    return lab;
   }
 
   // 同步抽屉联动：按钮始终可用（目标可为本机或服务器）；抽屉开着时按当前目标重绘
@@ -2035,7 +2162,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var rec = history[f.name];
 
     var card = document.createElement('div');
-    card.className = isNew ? 'card card-enter' : 'card';
+    var cardKey = 'L:' + f.name;
+    card.className = isNew ? 'card gallery-card card-enter' : 'card gallery-card';
+    if (gallerySelected[cardKey]) card.className += ' card-selected';
 
     // 缩略图：点击新窗口打开原图
     var link = document.createElement('a');
@@ -2082,6 +2211,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
+    ops.appendChild(makeGalleryCheck(cardKey, card)); // 左侧勾选：批量删除用
     // 下载：本机有字节，直接按当前目标的展示名保存
     ops.appendChild(makeDownloadButton('/files/' + encodeURIComponent(f.name), nameOnTarget(f.name, srv)));
     var del = document.createElement('button');
@@ -2103,7 +2233,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var remotePath = srv.dir + '/' + item.name;
 
     var card = document.createElement('div');
-    card.className = isNew ? 'card card-enter' : 'card';
+    var cardKey = 'R:' + item.name;
+    card.className = isNew ? 'card gallery-card card-enter' : 'card gallery-card';
+    if (gallerySelected[cardKey]) card.className += ' card-selected';
 
     var link = document.createElement('a');
     link.className = 'thumb';
@@ -2156,6 +2288,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var ops = document.createElement('div');
     ops.className = 'card-ops';
+    ops.appendChild(makeGalleryCheck(cardKey, card)); // 左侧勾选：批量删除用
     // 下载：经 /api/remote-file 代理取回字节，保存名去 md5 前缀还原原名
     ops.appendChild(makeDownloadButton(itemThumbUrl(item, srv), origFromName(item.name)));
     var del = document.createElement('button');
@@ -2704,6 +2837,122 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
   }
 
+  // =============== 图库批量选择删除 ===============
+
+  // 收集当前勾选条目：{ kind: 'L'|'R', name }
+  function gallerySelectedItems() {
+    var items = [];
+    Object.keys(gallerySelected).forEach(function (k) {
+      if (!gallerySelected[k]) return;
+      items.push({ kind: k.slice(0, 1), name: k.slice(2) });
+    });
+    return items;
+  }
+
+  // 批量删除：按当前目标作用域，语义与单张删除完全一致
+  //   服务器目标：只删该服务器上的文件与该目标的推送记录（L 与 R 皆可）
+  //   本机目标：删本地文件与记录；可选级联删所有服务器副本（远端先行，任一失败即中止）
+  async function galleryBatchDelete() {
+    if (galleryBusy) return;
+    var srv = currentServer();
+    var items = gallerySelectedItems();
+    if (!items.length) return;
+    if (srv && probeBusy[targetKey(srv)]) { hint('正在探测该目标，请稍后再删除', true); return; }
+
+    var n = items.length;
+    var copies = []; // 本机目标：所有选中本地文件的远端副本（按 host|dir 去重）
+    if (!srv) {
+      var seen = {};
+      items.forEach(function (it) {
+        if (it.kind !== 'L') return;
+        serverCopies(it.name).forEach(function (c) {
+          var k = c.host + '|' + c.dir;
+          if (seen[k]) return;
+          seen[k] = true;
+          copies.push(c);
+        });
+      });
+    }
+
+    var opts;
+    if (srv) {
+      opts = {
+        title: '批量删除远端文件',
+        message: '确定从「' + (srv.label || srv.host) + '」删除选中的 ' + n +
+          ' 项吗？将删除该服务器上的文件与该目标的推送记录。',
+      };
+    } else {
+      opts = { title: '批量删除本地文件', message: '确定删除选中的 ' + n + ' 个本地文件吗？' };
+      if (copies.length) opts.checkboxLabel = '同时删除所有服务器上的副本（' + copies.length + ' 台）';
+    }
+    var r = await showConfirm(opts);
+    if (!r.confirmed) return;
+
+    galleryBusy = true;
+    galleryBatchDel.disabled = true;
+    gallerySelAll.disabled = true;
+    updateGalleryToolbarLight();
+    var ok = 0;
+    var failed = [];
+    try {
+      // 级联删除远端副本：远端先行，任一失败即中止（保留本地文件便于重试）
+      if (!srv && r.checked && copies.length) {
+        for (var i = 0; i < copies.length; i++) {
+          galleryBatchDel.textContent = '删除远端 ' + (i + 1) + '/' + copies.length;
+          try {
+            await remoteDelete(copies[i], copies[i].remoteName);
+          } catch (e) {
+            failed.push(copies[i].label + '（' + (e.message || e) + '）');
+          }
+        }
+        if (failed.length) {
+          // 页面 JS 位于外层模板字符串内，禁用反斜杠转义，换行用 String.fromCharCode(10)
+          var nl = String.fromCharCode(10);
+          window.alert('以下服务器删除失败，已中止批量删除：' + nl + failed.join(nl));
+          return; // finally 复位 busy；保留勾选便于重试
+        }
+        copies.forEach(function (c) { dropRemoteIndexFile(c, c.remoteName); });
+      }
+
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j];
+        galleryBatchDel.textContent = '删除中 ' + (j + 1) + '/' + items.length;
+        try {
+          if (srv) {
+            if (it.kind === 'R') {
+              await remoteDelete(srv, it.name);
+              dropRemoteIndexFile(srv, it.name);
+            } else {
+              var t = findTargetRec(it.name, srv);
+              var remoteName = (t && (t.remoteName || baseName(t.remotePath))) || it.name;
+              await remoteDelete(srv, remoteName);
+              await dropTargetRecord(it.name, srv);
+              dropRemoteIndexFile(srv, remoteName);
+            }
+          } else {
+            await deleteLocal(it.name);
+            delete history[it.name];
+            try { await deleteHistoryEntry(it.name); } catch (e) { persistFail(e); }
+          }
+          ok++;
+        } catch (e) {
+          failed.push((srv ? nameOnTarget(it.name, srv) : origOf(it.name)) + '（' + (e.message || e) + '）');
+        }
+      }
+      gallerySelected = {}; // 主流程走完才清空勾选
+    } finally {
+      galleryBusy = false;
+      updateGalleryToolbarLight(); // 立即恢复按钮文案/可用性（refreshHistory 完成前）
+      refreshHistory(); // 同时刷新图库网格与（若开着的）同步抽屉
+    }
+    hint(ok ? ('已删除 ' + ok + ' 项' + (failed.length ? ('，失败 ' + failed.length + ' 项') : '')) : '批量删除失败',
+      !ok && !!failed.length);
+    if (failed.length) {
+      var nl2 = String.fromCharCode(10);
+      window.alert('部分删除失败：' + nl2 + failed.join(nl2));
+    }
+  }
+
   // 构建抽屉条目卡片：缩略图（本地或远端按需）+ 来源名 + 操作行（勾选 / 同步）
   function buildSyncCard(item, srcSrv, target, isNew) {
     var card = document.createElement('div');
@@ -2969,6 +3218,31 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     if (!srv) { hint('当前是本机目标，无需对账', true); return; }
     probeTarget(srv, true);
   });
+
+  // =============== 图库工具条事件 ===============
+  // 文件名筛选：输入即时重渲染（仅前端过滤，无网络请求）
+  galleryFilterEl.addEventListener('input', function () {
+    galleryFilter = galleryFilterEl.value || '';
+    renderGrid();
+  });
+  // 仅远端独有开关
+  filterRemoteOnlyEl.addEventListener('change', function () {
+    galleryRemoteOnly = !!filterRemoteOnlyEl.checked;
+    renderGrid();
+  });
+  // 全选 / 取消全选：作用于当前可见（筛选后）卡片
+  gallerySelAll.addEventListener('click', function () {
+    if (galleryBusy) return;
+    var keys = galleryVisibleCache;
+    if (!keys.length) return;
+    var allChecked = keys.every(function (k) { return gallerySelected[k]; });
+    keys.forEach(function (k) {
+      if (allChecked) delete gallerySelected[k];
+      else gallerySelected[k] = true;
+    });
+    renderGrid(); // 重建卡片以反映勾选态（签名含勾选位）
+  });
+  galleryBatchDel.addEventListener('click', galleryBatchDelete);
 
   // =============== 初始化 ===============
   // 用户切换目标：记住选择、按该目标过滤历史；切到服务器目标时异步探测+对账
