@@ -20,6 +20,8 @@ import {
   validateUser,
   validateDir,
   isValidStoredName,
+  isSafeSegment,
+  isImageName,
   computeServiceId,
   serviceIdFrom,
   getOrCreateSecret,
@@ -207,6 +209,39 @@ describe('纯函数：isValidStoredName', () => {
   });
 });
 
+describe('纯函数：isSafeSegment', () => {
+  test('接受安全文件名（含手工名、中文、空格、md5 前缀名）', () => {
+    assert.ok(isSafeSegment(`${HEX32}-x.png`));
+    assert.ok(isSafeSegment('manual-shot.png'));
+    assert.ok(isSafeSegment('a_b.c-d'));
+    assert.ok(isSafeSegment('我的图.png'));
+    assert.ok(isSafeSegment('a b.png'));
+    assert.ok(isSafeSegment('a$b`c"d.png'));
+  });
+
+  test('拒绝路径穿越 / 单引号 / 点文件 / 纯点 / 控制字符 / 空 / 超长 / 非字符串', () => {
+    const bad = [
+      '../etc/passwd', 'a/b.png', 'a\\b.png', "a'b.png", '.', '..', '.hidden', '.tmp',
+      'a\u0000b', 'a\nb', '', undefined, null, 123, 'x'.repeat(256),
+    ];
+    for (const v of bad) {
+      assert.equal(isSafeSegment(v), false, `应拒绝: ${JSON.stringify(v)}`);
+    }
+  });
+});
+
+describe('纯函数：isImageName', () => {
+  test('常见图片扩展名（大小写不敏感）为真，其余为假', () => {
+    assert.ok(isImageName('a.png'));
+    assert.ok(isImageName('a.JPG'));
+    assert.ok(isImageName('a.webp'));
+    assert.ok(isImageName('我的图.svg'));
+    assert.equal(isImageName('a.txt'), false);
+    assert.equal(isImageName('README'), false);
+    assert.equal(isImageName('a.png.bak'), false);
+  });
+});
+
 describe('纯函数：md5OfName / origFromStoredName', () => {
   test('合法存储名取出 md5 与原名', () => {
     assert.equal(md5OfName(`${HEX32}-a.png`), HEX32);
@@ -224,14 +259,16 @@ describe('纯函数：md5OfName / origFromStoredName', () => {
 });
 
 describe('纯函数：validateRemoteFileName', () => {
-  test('接受安全文件名（含无 md5 前缀的手工名）', () => {
+  test('接受安全文件名（含无 md5 前缀的手工名、中文/空格）', () => {
     assert.equal(validateRemoteFileName(`${HEX32}-a.png`), `${HEX32}-a.png`);
     assert.equal(validateRemoteFileName('manual-shot.png'), 'manual-shot.png');
     assert.equal(validateRemoteFileName('a_b.c-d'), 'a_b.c-d');
+    assert.equal(validateRemoteFileName('我的图.png'), '我的图.png');
+    assert.equal(validateRemoteFileName('a b.png'), 'a b.png');
   });
 
-  test('拒绝路径穿越 / 引号 / 空白 / 纯点 / 非字符串', () => {
-    const bad = ['../etc/passwd', 'a/b.png', "a'b.png", 'a b.png', '.', '..', '', undefined, null];
+  test('拒绝路径穿越 / 单引号 / 点文件 / 纯点 / 控制字符 / 非字符串', () => {
+    const bad = ['../etc/passwd', 'a/b.png', "a'b.png", '.', '..', '.hidden', 'a\u0000b', '', undefined, null];
     for (const v of bad) {
       assert.equal(validateRemoteFileName(v), null, `应拒绝: ${JSON.stringify(v)}`);
     }
@@ -284,10 +321,13 @@ describe('纯函数：parseRemoteList', () => {
     assert.deepEqual(parseRemoteList('::DIR_MISSING::'), { dirExists: false, hasRsync: false, files: [] });
   });
 
-  test('非法名（含空格/引号）被忽略，标记行不入清单', () => {
-    const out = ['::DIR_OK::', '::RSYNC_OK::', 'a b.png', "a'b.png", 'ok.png'].join('\n');
+  test('单引号名被忽略，中文/空格名保留，标记行不入清单', () => {
+    const out = ['::DIR_OK::', '::RSYNC_OK::', '我的 图.png', "a'b.png", 'ok.png'].join('\n');
     const parsed = parseRemoteList(out);
-    assert.deepEqual(parsed.files, [{ name: 'ok.png', md5: null }]);
+    assert.deepEqual(parsed.files, [
+      { name: '我的 图.png', md5: null },
+      { name: 'ok.png', md5: null },
+    ]);
   });
 
   test('文件名与旧标记同名不再冲突（标记已改为 :: 前缀）', () => {
@@ -378,12 +418,18 @@ describe('纯函数：buildProbeScript（妙传探测脚本）', () => {
     assert.equal(script, `mkdir -p '/tmp/d'; if false; then echo EXISTS; else echo MISSING; fi`);
   });
 
-  test('家目录形式 ~/d 用 "$HOME/d" 展开，且文件名并入同一表达式', () => {
+  test('家目录形式 ~/d 用 "$HOME/d" 展开，文件名用单引号承载', () => {
     const script = buildProbeScript(`${HEX32}-x.png`, '~/d');
     assert.equal(
       script,
-      `mkdir -p "$HOME/d"; if test -f "$HOME/d/${HEX32}-x.png" && md5sum "$HOME/d/${HEX32}-x.png" 2>/dev/null | grep -q '^${HEX32}'; then echo EXISTS; else echo MISSING; fi`,
+      `mkdir -p "$HOME/d"; if test -f "$HOME/d"'/${HEX32}-x.png' && md5sum "$HOME/d"'/${HEX32}-x.png' 2>/dev/null | grep -q '^${HEX32}'; then echo EXISTS; else echo MISSING; fi`,
     );
+  });
+
+  test('中文/空格文件名在单引号内安全嵌入（~/ 分支）', () => {
+    const script = buildProbeScript(`${HEX32}-我的 图.png`, '~/d');
+    assert.ok(script.includes(`'/${HEX32}-我的 图.png'`), '文件名应以单引号承载');
+    assert.ok(script.includes('mkdir -p "$HOME/d"'), '家目录仍以双引号展开');
   });
 });
 
@@ -488,15 +534,19 @@ describe('POST /sync（从图库补齐接口）', () => {
     return (await res.json()).localName;
   }
 
-  test('缺 name / name 不合法 → 400', async () => {
+  test('缺 name / name 不合法 → 400；合法但不存在 → 404', async () => {
     // 缺 name
     let r = await fetch(`${base}/sync?host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
     assert.equal(r.status, 400);
-    // 非 <md5>- 前缀（含路径穿越串）→ 400
+    // 含路径分隔符 → 400
     r = await fetch(`${base}/sync?name=evil%2F..%2Fx.png&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
     assert.equal(r.status, 400);
-    r = await fetch(`${base}/sync?name=x.png&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    // 含单引号 → 400
+    r = await fetch(`${base}/sync?name=${encodeURIComponent("a'b.png")}&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
     assert.equal(r.status, 400);
+    // 合法手工名但本机图库不存在 → 404
+    r = await fetch(`${base}/sync?name=x.png&host=127.0.0.1&dir=/tmp/x`, { method: 'POST' });
+    assert.equal(r.status, 404);
   });
 
   test('host 缺失/非法、dir 缺失 → 400', async () => {
@@ -535,6 +585,21 @@ describe('POST /sync（从图库补齐接口）', () => {
     // 服务仍可用
     const health = await fetch(`${base}/health`);
     assert.equal(health.status, 200);
+  });
+
+  test('手工图片（无 md5 前缀，含中文）可通过 /sync 名称校验并进入同步流程', async () => {
+    const manual = 'logo.png';
+    const cn = '我的图.png';
+    fs.writeFileSync(path.join(snapDir, manual), Buffer.from([1, 2, 3]));
+    fs.writeFileSync(path.join(snapDir, cn), Buffer.from([4, 5, 6]));
+    for (const name of [manual, cn]) {
+      const r = await fetch(
+        `${base}/sync?name=${encodeURIComponent(name)}&host=127.0.0.256&user=root&dir=/tmp/x`,
+        { method: 'POST' },
+      );
+      assert.equal(r.status, 500, `${name} 通过校验后应进入 ssh 同步（目标不可达 → 500）`);
+      assert.match((await r.json()).error, /ssh/);
+    }
   });
 });
 
@@ -916,6 +981,42 @@ describe('HTTP 基础接口', () => {
     assert.ok(idxOlder >= 0 && idxNewer >= 0, '两个测试文件都应在图库中');
     assert.ok(idxNewer < idxOlder, '较新的文件应排在前面');
   });
+
+  test('手工图片（非 md5 命名，含中文）被图库收录且可读/删；非图片与点文件不收录', async () => {
+    const manual = 'logo.png';
+    const cn = '我的图.png';
+    fs.writeFileSync(path.join(snapDir, manual), Buffer.from([1, 2, 3]));
+    fs.writeFileSync(path.join(snapDir, cn), Buffer.from([4, 5, 6]));
+    fs.writeFileSync(path.join(snapDir, 'notes.txt'), 'x'); // 非图片
+    fs.writeFileSync(path.join(snapDir, '.hidden.png'), 'x'); // 点文件（模拟临时/隐藏文件）
+
+    const lib = await (await fetch(`${base}/api/library`)).json();
+    const names = lib.files.map((f) => f.name);
+    assert.ok(names.includes(manual), '应收录 logo.png');
+    assert.ok(names.includes(cn), '应收录中文名图片');
+    assert.ok(!names.includes('notes.txt'), '非图片不应收录');
+    assert.ok(!names.includes('.hidden.png'), '点文件不应收录');
+
+    // 读取中文名图片
+    const g = await fetch(`${base}/files/${encodeURIComponent(cn)}`);
+    assert.equal(g.status, 200);
+    assert.deepEqual(Buffer.from(await g.arrayBuffer()), Buffer.from([4, 5, 6]));
+    // 删除手工图片
+    assert.equal((await fetch(`${base}/files/${encodeURIComponent(manual)}`, { method: 'DELETE' })).status, 200);
+    assert.ok(!fs.existsSync(path.join(snapDir, manual)));
+
+    fs.rmSync(path.join(snapDir, cn), { force: true });
+    fs.rmSync(path.join(snapDir, 'notes.txt'), { force: true });
+    fs.rmSync(path.join(snapDir, '.hidden.png'), { force: true });
+  });
+
+  test('GET /files/<不安全名> → 400（点文件 / 单引号 / 控制字符）', async () => {
+    const bad = ['.x.png', "a'b.png", 'a%00b.png'];
+    for (const n of bad) {
+      const res = await fetch(`${base}/files/${n}`);
+      assert.equal(res.status, 400, `name=${n} 应 400，实际 ${res.status}`);
+    }
+  });
 });
 
 // =====================================================================
@@ -1255,13 +1356,14 @@ describe('服务端 history 接口', () => {
   });
 
   test('batch 含非法 upsert 返回 400 且不写入', async () => {
+    const bad = "bad'name"; // 含单引号：不安全文件名
     const res = await fetch(`${base}/api/history/batch`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ upserts: { 'bad name': { orig: 'x', targets: [] } } }),
+      body: JSON.stringify({ upserts: { [bad]: { orig: 'x', targets: [] } } }),
     });
     assert.equal(res.status, 400);
     const r = await (await fetch(`${base}/api/history`)).json();
-    assert.ok(!r.history['bad name']);
+    assert.ok(!r.history[bad]);
   });
 
   test('DELETE 单条（幂等）', async () => {
@@ -1269,6 +1371,16 @@ describe('服务端 history 接口', () => {
     assert.equal((await fetch(`${base}/api/history/${encodeURIComponent(NAME2)}`, { method: 'DELETE' })).status, 200);
     const r = await (await fetch(`${base}/api/history`)).json();
     assert.deepEqual(r.history, {});
+  });
+
+  test('手工名（无 md5 前缀，含中文）PUT/DELETE 可用', async () => {
+    const manual = '我的图.png';
+    assert.equal((await put(manual, { orig: manual, targets: [] })).status, 200);
+    let r = await (await fetch(`${base}/api/history`)).json();
+    assert.ok(r.history[manual], '应写入手工名记录');
+    assert.equal((await fetch(`${base}/api/history/${encodeURIComponent(manual)}`, { method: 'DELETE' })).status, 200);
+    r = await (await fetch(`${base}/api/history`)).json();
+    assert.ok(!r.history[manual], '应删除手工名记录');
   });
 
   test('落盘 history.json（对象形状）', async () => {
@@ -1991,7 +2103,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
   // 页面应内嵌图库批量选择/筛选工具条
   test('图库工具条含筛选/全选/批量删除控件', async () => {
     const html = await (await fetch(`${base}/`)).text();
-    ['galleryFilter', 'remoteOnlyWrap', 'filterRemoteOnly', 'gallerySelInfo', 'gallerySelAll', 'galleryBatchDel']
+    ['galleryFilter', 'uniqueFilterWrap', 'filterUnique', 'uniqueFilterLabel', 'gallerySelInfo', 'gallerySelAll', 'galleryBatchDel']
       .forEach((id) => assert.ok(html.includes(`id="${id}"`), `页面应含 id="${id}"`));
     assert.ok(html.includes('makeGalleryCheck('), '应包含图库勾选框构建逻辑');
     assert.ok(html.includes('galleryBatchDelete'), '应包含批量删除逻辑');
@@ -2079,11 +2191,11 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     });
     await new Promise((r) => setTimeout(r, 60));
     const grid = byId['grid'];
-    assert.equal(byId['remoteOnlyWrap'].hidden, false, '服务器目标应显示「仅远端独有」开关');
+    assert.equal(byId['uniqueFilterLabel'].textContent, '仅远端独有', '服务器目标标签应为「仅远端独有」');
     assert.ok(hasText(grid, 'local.png') && hasText(grid, 'remote.png'), '应同时渲染本地与远端独有卡片');
 
-    byId['filterRemoteOnly'].checked = true;
-    byId['filterRemoteOnly']._trigger('change');
+    byId['filterUnique'].checked = true;
+    byId['filterUnique']._trigger('change');
     assert.ok(!hasText(grid, 'local.png'), '仅远端独有：本地卡片应隐藏');
     assert.ok(hasText(grid, 'remote.png'), '仅远端独有：远端独有卡片应保留');
 
@@ -2190,6 +2302,119 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     assert.equal(fileDeletes.length, 2, '应对两个本地文件各发起一次删除');
     assert.ok(fileDeletes.every((u) => u.includes('/files/')), '应调用 /files/<name>');
     assert.ok(!hasText(grid, 'alpha.png') && !hasText(grid, 'beta.png'), '删除后两张卡片应消失');
+  });
+
+  // 本机视图：无有效推送记录 → 「本机独有」徽标；「仅本机独有」筛选
+  test('本机视图：「本机独有」徽标 + 「仅本机独有」筛选', async () => {
+    const MANUAL = 'logo.png'; // 无记录 → 本机独有
+    const PUSHED = `${HEX32}-pushed.png`; // 有有效记录 → 非本机独有
+    const STALE = `${'e'.repeat(32)}-stale.png`; // 仅 stale 记录 → 本机独有
+    const store = new Map();
+    const history = {
+      [PUSHED]: {
+        orig: 'pushed.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: PUSHED, remotePath: `/tmp/x/${PUSHED}`, method: 'rsync', time: new Date().toISOString(),
+        }],
+      },
+      [STALE]: {
+        orig: 'stale.png',
+        targets: [{
+          key: 's1', label: 'A', host: '127.0.0.1', dir: '/tmp/x',
+          remoteName: STALE, remotePath: `/tmp/x/${STALE}`, method: 'rsync', stale: true, time: new Date().toISOString(),
+        }],
+      },
+    };
+    const { byId } = await bootPage({
+      store, history,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [
+              { name: MANUAL, size: 10, mtime: new Date().toISOString() },
+              { name: PUSHED, size: 20, mtime: new Date().toISOString() },
+              { name: STALE, size: 30, mtime: new Date().toISOString() },
+            ] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    assert.equal(byId['uniqueFilterLabel'].textContent, '仅本机独有', '本机目标标签应为「仅本机独有」');
+    // logo.png（无记录）与 stale.png（仅失效记录）各一个徽标；pushed.png 无
+    assert.equal(collectNodes(grid, (n) => n.textContent === '本机独有').length, 2, '应有两个「本机独有」徽标');
+    assert.ok(hasText(grid, 'pushed.png'), '有有效记录的文件应正常显示');
+
+    byId['filterUnique'].checked = true;
+    byId['filterUnique']._trigger('change');
+    assert.ok(hasText(grid, 'logo.png') && hasText(grid, 'stale.png'), '仅本机独有：无记录/仅失效记录的图保留');
+    assert.ok(!hasText(grid, 'pushed.png'), '仅本机独有：已推送的图隐藏');
+  });
+
+  // 服务器视图：本地手工图与远端同名文件去重，不重复出卡
+  test('服务器视图：本地手工图与远端同名文件去重', async () => {
+    const MANUAL = 'logo.png';
+    const store = new Map();
+    store.set('snap-push.target', JSON.stringify('s1'));
+    const servers = [{ id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' }];
+    store.set('snap-push.remoteIndex', JSON.stringify({
+      '127.0.0.1|/tmp/x': { fetchedAt: Date.now(), files: [{ name: MANUAL, md5: null }] },
+    }));
+    const { byId } = await bootPage({
+      store, servers, history: {},
+      fetchImpl: async (url) => {
+        const u = String(url);
+        let body;
+        if (u.includes('/api/library')) body = { files: [{ name: MANUAL, size: 10, mtime: new Date().toISOString() }] };
+        else if (u.includes('/api/remote')) body = { ok: true, dirExists: true, hasRsync: true, files: [{ name: MANUAL, md5: null }] };
+        else body = { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    assert.ok(hasText(grid, 'logo.png'), '应渲染本地卡片');
+    assert.ok(!hasText(grid, '远端独有'), '同名远端文件不应再出「远端独有」卡片');
+    assert.equal(
+      collectNodes(grid, (n) => typeof n.className === 'string' && n.className.indexOf('gallery-card') >= 0).length,
+      1,
+      '应只有一张卡片',
+    );
+  });
+
+  // 同步抽屉：手工图列为待同步项，同步成功后消失
+  test('同步抽屉：手工图列为待同步项，同步成功后消失', async () => {
+    const MANUAL = 'logo.png';
+    const store = new Map();
+    store.set('snap-push.target', JSON.stringify('s1'));
+    const servers = [{ id: 's1', label: 'A', host: '127.0.0.1', user: 'root', dir: '/tmp/x', urlBase: '' }];
+    const { byId } = await bootPage({
+      store, servers, history: {},
+      fetchImpl: async (url) => {
+        const u = String(url);
+        if (u.includes('/sync')) {
+          return { ok: true, status: 200, json: async () => ({ ok: true, localName: MANUAL, remotePath: `/tmp/x/${MANUAL}`, method: 'rsync' }) };
+        }
+        let body;
+        if (u.includes('/api/library')) body = { files: [{ name: MANUAL, size: 10, mtime: new Date().toISOString() }] };
+        else if (u.includes('/api/remote')) body = { ok: true, dirExists: true, hasRsync: true, files: [] };
+        else body = { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    byId['syncLibBtn']._trigger('click'); // 打开同步抽屉
+    const list = byId['syncList'];
+    assert.ok(hasText(list, 'logo.png'), '手工图应作为待同步项出现在抽屉');
+    const syncBtn = findNode(list, (n) => n.tagName === 'BUTTON' && n.textContent === '同步');
+    assert.ok(syncBtn, '抽屉条目应有「同步」按钮');
+    syncBtn._trigger('click');
+    await new Promise((r) => setTimeout(r, 100));
+    // 垫片 classList.contains 恒为 false，refreshHistory 不会自动重绘抽屉；手动重开以触发重绘
+    byId['syncLibBtn']._trigger('click');
+    assert.ok(!hasText(list, 'logo.png'), '同步成功后手工图应从待同步项消失');
   });
 });
 

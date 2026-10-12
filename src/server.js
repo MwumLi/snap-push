@@ -117,11 +117,12 @@ function remoteShellDir(dir) {
 
 /**
  * 远端目录下某文件的 shell 表达式：
- * - 绝对路径 → 单引号整体 `'/tmp/x/a.png'`（与改造前输出一致）；
- * - `~/x` → `"$HOME/x/a.png"`（远端 shell 展开家目录；x/name 已过白名单，无 $/反引号/引号）。
+ * - 绝对路径 → 单引号整体 `'/tmp/x/a.png'`（name 已过 isSafeSegment，不含单引号，安全）；
+ * - `~/x` → `"$HOME/x"` 拼接单引号文件名 `'/a.png'`：双引号展开家目录，单引号承载 name，
+ *   因此含 $/反引号/双引号/空格/中文的名字也不会被 shell 二次解释。
  */
 function remoteShellFile(dir, name) {
-  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}/${name}"`;
+  if (dir.startsWith('~/')) return `"$HOME/${dir.slice(2)}"'/${name}'`;
   return `'${dir}/${name}'`;
 }
 
@@ -131,6 +132,24 @@ function remoteShellFile(dir, name) {
  */
 export function isValidStoredName(name) {
   return typeof name === 'string' && /^[0-9a-f]{32}-[A-Za-z0-9._-]+$/.test(name);
+}
+
+/**
+ * 安全文件名段（本地图库与远端通用）：
+ * - 单段路径（不含 / 与反斜杠），排除 . / .. 与点开头（点文件、.tmp 临时文件）；
+ * - 禁单引号：远端命令用单引号包裹路径，禁 ' 即杜绝 shell 逃逸；其余字符在单引号内均为字面量，
+ *   故中文、空格、$、反引号、" 均安全；
+ * - 禁控制字符；长度上限 255。
+ * 合法返回 true，非法返回 false。
+ */
+export function isSafeSegment(name) {
+  if (typeof name !== 'string') return false;
+  if (name.length === 0 || name.length > 255) return false;
+  if (name === '.' || name === '..') return false;
+  if (name.charAt(0) === '.') return false; // 点文件 / 原子写临时文件
+  // eslint-disable-next-line no-control-regex
+  if (/[\/\\'\u0000-\u001f\u007f]/.test(name)) return false;
+  return true;
 }
 
 /**
@@ -152,14 +171,12 @@ export function origFromStoredName(name) {
 }
 
 /**
- * 校验远端文件名（比本地存储名宽松）：仅允许 [A-Za-z0-9._-]。
- * 不含斜杠、引号、空白，因此可安全嵌入单引号 shell 命令；
+ * 校验远端文件名：与本地一致，改用 isSafeSegment（支持中文/空格等，禁单引号与控制字符）。
+ * 不含斜杠、单引号，因此可安全嵌入单引号 shell 命令；
  * 同时兼容用户手工放进目标目录、不带 md5 前缀的文件。
- * 纯点（. / ..）单独拒绝，避免目录穿越语义。
  */
 export function validateRemoteFileName(name) {
-  if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
-  return /^\.+$/.test(name) ? null : name;
+  return isSafeSegment(name) ? name : null;
 }
 
 /**
@@ -222,6 +239,11 @@ const MIME_BY_EXT = new Map([
 export function mimeOf(name) {
   const ext = /\.([A-Za-z0-9]+)$/.exec(name);
   return (ext && MIME_BY_EXT.get(ext[1].toLowerCase())) || 'application/octet-stream';
+}
+
+/** 是否图片类文件名（按扩展名判定，未知/无扩展名不算） */
+export function isImageName(name) {
+  return mimeOf(name) !== 'application/octet-stream';
 }
 
 // =====================================================================
@@ -780,6 +802,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 /* —— 卡片状态徽标 —— */
 .badge-stale { background: #cf222e; }
 .badge-remote-only { background: #0969da; }
+.badge-local-only { background: #8250df; }
 /* —— 抽屉来源选择 —— */
 .drawer-src { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #f0f2f4; font-size: 12px; }
 .drawer-src select { flex: 1; }
@@ -846,8 +869,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     <!-- 图库工具条：文件名筛选 + 仅远端独有（仅服务器目标）+ 全选 + 批量删除 -->
     <div class="gallery-bar">
       <input type="search" id="galleryFilter" placeholder="筛选文件名…" autocomplete="off" aria-label="按文件名筛选">
-      <label class="gallery-toggle" id="remoteOnlyWrap" hidden>
-        <input type="checkbox" id="filterRemoteOnly">仅远端独有
+      <label class="gallery-toggle" id="uniqueFilterWrap">
+        <input type="checkbox" id="filterUnique"><span id="uniqueFilterLabel">仅远端独有</span>
       </label>
       <span class="gallery-selinfo" id="gallerySelInfo"></span>
       <button type="button" id="gallerySelAll" disabled>全选</button>
@@ -999,7 +1022,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var syncBusy = false; // 同步进行中：期间禁用勾选/按钮，避免交叉
   var gallerySelected = {}; // 图库勾选集合：键 -> true，键 = 'L:<本地名>' | 'R:<远端名>'
   var galleryFilter = ''; // 图库文件名筛选关键字（原始输入，匹配时转小写）
-  var galleryRemoteOnly = false; // 图库「仅远端独有」筛选（仅服务器目标有意义）
+  var galleryOnlyUnique = false; // 图库「仅独有」筛选：本机目标=仅本机独有；服务器目标=仅远端独有
   var galleryBusy = false; // 图库批量删除进行中：锁定工具条与卡片勾选
   var galleryVisibleCache = []; // 最近一次渲染的可见卡片键（供勾选即时刷新工具条，免整页重渲染）
 
@@ -1028,8 +1051,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   var grid = document.getElementById('grid');
   var historyCount = document.getElementById('historyCount');
   var galleryFilterEl = document.getElementById('galleryFilter');
-  var remoteOnlyWrap = document.getElementById('remoteOnlyWrap');
-  var filterRemoteOnlyEl = document.getElementById('filterRemoteOnly');
+  var uniqueFilterWrap = document.getElementById('uniqueFilterWrap');
+  var filterUniqueEl = document.getElementById('filterUnique');
+  var uniqueFilterLabel = document.getElementById('uniqueFilterLabel');
   var gallerySelInfo = document.getElementById('gallerySelInfo');
   var gallerySelAll = document.getElementById('gallerySelAll');
   var galleryBatchDel = document.getElementById('galleryBatchDel');
@@ -1259,6 +1283,20 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       if (md5Of(libFiles[i].name) === md5) return libFiles[i].name;
     }
     return null;
+  }
+
+  // 本地图库中是否含该文件名的条目（无 md5 的手工图按名字匹配）
+  function localFileByName(name) {
+    for (var i = 0; i < libFiles.length; i++) {
+      if (libFiles[i].name === name) return libFiles[i];
+    }
+    return null;
+  }
+
+  // 是否有「有效」推送记录（存在非 stale 的 target）——「本机独有」判定（历史口径）
+  function hasValidTarget(name) {
+    var rec = history[name];
+    return !!(rec && Array.isArray(rec.targets) && rec.targets.some(function (t) { return !t.stale; }));
   }
 
   // 组装“已恢复”记录：本地有字节、远端确认存在、但缺 history（#3 场景）
@@ -1995,7 +2033,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 
     var locals = libFiles.filter(function (f) {
       if (!srv) return true;
-      return targetHasMd5(srv, md5Of(f.name)); // history 记录或远端清单命中
+      // md5 命名走内容匹配；手工图无 md5 → 按历史记录/远端同名清单匹配
+      return targetHasMd5(srv, md5Of(f.name)) || targetHasName(srv, f.name);
     });
 
     var remotes = [];
@@ -2008,18 +2047,21 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
             if (localNameByMd5(f.md5)) return; // 本地已有同内容 → 走本地卡片
             if (seen[f.md5]) return; // 同 md5 只展示一条
             seen[f.md5] = true;
+          } else if (localFileByName(f.name)) {
+            return; // 无 md5 的远端文件若与本地同名 → 走本地卡片，避免重复
           }
-          remotes.push(f); // 无 md5 的手工文件无法与本地去重，照常展示
+          remotes.push(f);
         });
         remotes.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
       }
     }
 
-    // —— 筛选：仅远端独有（仅服务器目标）+ 文件名关键字 ——
+    // —— 筛选：仅独有（按目标自适应）+ 文件名关键字 ——
     // 本地卡片按「当前目标下的展示名」匹配，远端独有卡片按去掉 md5 前缀的原名匹配。
     var kw = galleryFilter.trim().toLowerCase();
-    var onlyRemote = galleryRemoteOnly && !!srv;
-    var visibleLocals = onlyRemote ? [] : locals.filter(function (f) {
+    // 仅独有：服务器目标 → 只留远端独有；本机目标 → 只留无有效推送记录的本地图
+    var visibleLocals = (galleryOnlyUnique && !!srv) ? [] : locals.filter(function (f) {
+      if (galleryOnlyUnique && !srv && hasValidTarget(f.name)) return false;
       return !kw || nameOnTarget(f.name, srv).toLowerCase().indexOf(kw) >= 0;
     });
     var visibleRemotes = remotes.filter(function (f) {
@@ -2097,17 +2139,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return n;
   }
 
-  // 图库工具条刷新：远端独有开关显隐 + 可见键缓存 + 计数/按钮
+  // 图库工具条刷新：「独有」开关标签随目标自适应 + 可见键缓存 + 计数/按钮
   function renderGalleryToolbar(visibleLocals, visibleRemotes, srv) {
-    // 「仅远端独有」仅服务器目标可用；切到本机时隐藏并复位
-    if (srv) {
-      remoteOnlyWrap.hidden = false;
-      filterRemoteOnlyEl.checked = galleryRemoteOnly;
-    } else {
-      remoteOnlyWrap.hidden = true;
-      galleryRemoteOnly = false;
-      filterRemoteOnlyEl.checked = false;
-    }
+    // 标签：服务器目标 → 仅远端独有；本机目标 → 仅本机独有（切换目标时由 targetSel 复位勾选）
+    uniqueFilterLabel.textContent = srv ? '仅远端独有' : '仅本机独有';
+    filterUniqueEl.checked = galleryOnlyUnique;
     galleryVisibleCache = galleryVisibleKeys(visibleLocals, visibleRemotes);
     updateGalleryToolbarLight();
   }
@@ -2199,11 +2235,21 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
       : [];
     var list = document.createElement('div');
     list.className = 'targets';
+    // 本机视图：无有效推送记录 → 标「本机独有」（与服务器视图「远端独有」对称）
+    var localOnly = !srv && !hasValidTarget(f.name);
+    if (localOnly) {
+      var loHead = document.createElement('div');
+      loHead.className = 'target-head';
+      loHead.appendChild(makeStateBadge('local-only', '本机独有'));
+      list.appendChild(loHead);
+    }
     if (!records.length) {
-      var none = document.createElement('div');
-      none.className = 'target-none';
-      none.textContent = srv ? '尚未推送到该服务器' : '无推送记录（仅本机预览）';
-      list.appendChild(none);
+      if (!localOnly) { // 有「本机独有」徽标时不再重复「无推送记录」提示
+        var none = document.createElement('div');
+        none.className = 'target-none';
+        none.textContent = srv ? '尚未推送到该服务器' : '无推送记录（仅本机预览）';
+        list.appendChild(none);
+      }
     } else {
       records.forEach(function (x) { list.appendChild(makeTargetRow(x, f.name)); });
     }
@@ -2728,6 +2774,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     return false;
   }
 
+  // 目标是否已有该「文件名」（无 md5 的手工图按名字匹配）：
+  // 有该目标的 history 记录，或远端清单含同名文件
+  function targetHasName(srv, name) {
+    if (!srv || !name) return false;
+    if (findTargetRec(name, srv)) return true;
+    var idx = remoteIndex[targetKey(srv)];
+    return !!(idx && Array.isArray(idx.files) && idx.files.some(function (f) { return f.name === name; }));
+  }
+
   // 抽屉待同步项 = 来源清单里「目标还没有」的条目（同 md5 只保留一条）
   function missingItems() {
     var target = currentServer();
@@ -2736,10 +2791,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     var seen = {};
     var out = [];
     files.forEach(function (f) {
-      if (targetHasMd5(target, f.md5)) return;
       if (f.md5) {
+        if (targetHasMd5(target, f.md5)) return;
         if (seen[f.md5]) return; // 同内容多副本：只展示一条
         seen[f.md5] = true;
+      } else if (targetHasName(target, f.name)) {
+        return; // 无 md5 的手工图：按名字判断目标是否已有
       }
       out.push(f);
     });
@@ -3225,9 +3282,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     galleryFilter = galleryFilterEl.value || '';
     renderGrid();
   });
-  // 仅远端独有开关
-  filterRemoteOnlyEl.addEventListener('change', function () {
-    galleryRemoteOnly = !!filterRemoteOnlyEl.checked;
+  // 仅独有开关：本机目标=仅本机独有；服务器目标=仅远端独有
+  filterUniqueEl.addEventListener('change', function () {
+    galleryOnlyUnique = !!filterUniqueEl.checked;
     renderGrid();
   });
   // 全选 / 取消全选：作用于当前可见（筛选后）卡片
@@ -3248,6 +3305,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
   // 用户切换目标：记住选择、按该目标过滤历史；切到服务器目标时异步探测+对账
   targetSel.addEventListener('change', function () {
     saveJson(TARGET_KEY, targetSel.value);
+    galleryOnlyUnique = false; // 切换目标时复位「仅独有」开关（标签含义随目标变化）
     renderGrid();
     var srv = currentServer();
     if (srv) probeTarget(srv, false);
@@ -3459,8 +3517,8 @@ function parseTargetParams(params) {
 async function handleSync(req, res, params, ctx) {
   req.resume(); // /sync 无请求体
   const name = params.get('name') || '';
-  if (!isValidStoredName(name)) {
-    return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法（须为图库文件名 <md5>-原名）' });
+  if (!isSafeSegment(name) || !isImageName(name)) {
+    return sendJson(res, 400, { ok: false, error: 'name 缺失或不合法' });
   }
   const pt = parseTargetParams(params);
   if (!pt.ok) {
@@ -3685,13 +3743,14 @@ async function handlePull(req, res, params, ctx) {
   });
 }
 
-/** GET /api/library：列出本机目录中所有合法存储名文件，按 mtime 降序（新图在前） */
+/** GET /api/library：列出本机目录中所有图片文件（含手工放入的），按 mtime 降序（新图在前） */
 async function handleLibrary(res, ctx) {
   await ensureDir(ctx.snapDir);
   const entries = await fs.promises.readdir(ctx.snapDir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (!entry.isFile() || !isValidStoredName(entry.name)) continue; // 只认 <md5>- 前缀的图片文件
+    // 收录任意图片：名字安全（isSafeSegment 排除点文件/临时文件/路径分隔符）+ 图片扩展名
+    if (!entry.isFile() || !isSafeSegment(entry.name) || !isImageName(entry.name)) continue;
     const stat = await fs.promises.stat(path.join(ctx.snapDir, entry.name));
     files.push({ name: entry.name, size: stat.size, mtime: stat.mtime.toISOString() });
   }
@@ -3701,7 +3760,7 @@ async function handleLibrary(res, ctx) {
 
 /** GET /files/<name>：返回图片字节与对应 Content-Type */
 async function handleGetFile(res, name, ctx) {
-  if (!isValidStoredName(name)) {
+  if (!isSafeSegment(name) || !isImageName(name)) {
     return sendJson(res, 400, { ok: false, error: '文件名不合法' });
   }
   let data;
@@ -3717,7 +3776,7 @@ async function handleGetFile(res, name, ctx) {
 
 /** DELETE /files/<name>：删除本机文件 */
 async function handleDeleteFile(res, name, ctx) {
-  if (!isValidStoredName(name)) {
+  if (!isSafeSegment(name) || !isImageName(name)) {
     return sendJson(res, 400, { ok: false, error: '文件名不合法' });
   }
   try {
@@ -3837,9 +3896,9 @@ async function handleListHistory(res, ctx) {
   sendJson(res, 200, { ok: true, history: ctx.historyStore.read() });
 }
 
-/** PUT /api/history/:name：覆盖式 upsert 单条（name 必须为合法存储名） */
+/** PUT /api/history/:name：覆盖式 upsert 单条（name 必须为安全文件名段） */
 async function handlePutHistory(req, res, name, ctx) {
-  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  if (!isSafeSegment(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
   const body = await readJsonBody(req);
   if (!isValidHistoryEntry(body)) {
     return sendJson(res, 400, { ok: false, error: '请求体不合法：需为 { orig, targets[] }' });
@@ -3850,7 +3909,7 @@ async function handlePutHistory(req, res, name, ctx) {
 
 /** DELETE /api/history/:name：删除单条；幂等 */
 async function handleDeleteHistory(res, name, ctx) {
-  if (!isValidStoredName(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
+  if (!isSafeSegment(name)) return sendJson(res, 400, { ok: false, error: 'name 不合法' });
   await ctx.historyStore.update((h) => { delete h[name]; });
   sendJson(res, 200, { ok: true });
 }
@@ -3863,7 +3922,7 @@ async function handleBatchHistory(req, res, ctx) {
     ? body.upserts : {};
   const deletes = Array.isArray(body.deletes) ? body.deletes : [];
   for (const [name, entry] of Object.entries(upserts)) {
-    if (!isValidStoredName(name) || !isValidHistoryEntry(entry)) {
+    if (!isSafeSegment(name) || !isValidHistoryEntry(entry)) {
       return sendJson(res, 400, { ok: false, error: `upserts 含非法项：${name}` });
     }
   }
