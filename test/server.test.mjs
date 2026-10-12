@@ -22,6 +22,9 @@ import {
   isValidStoredName,
   isSafeSegment,
   isImageName,
+  rectsIntersect,
+  computeMarqueeKeys,
+  scrollStep,
   computeServiceId,
   serviceIdFrom,
   getOrCreateSecret,
@@ -239,6 +242,45 @@ describe('纯函数：isImageName', () => {
     assert.equal(isImageName('a.txt'), false);
     assert.equal(isImageName('README'), false);
     assert.equal(isImageName('a.png.bak'), false);
+  });
+});
+
+describe('纯函数：rectsIntersect / computeMarqueeKeys（画框选择）', () => {
+  const A = { left: 0, top: 0, right: 10, bottom: 10 };
+
+  test('rectsIntersect：相交 / 包含 / 相离 / 边界相接 / 空值', () => {
+    assert.ok(rectsIntersect(A, { left: 5, top: 5, right: 15, bottom: 15 }), '部分重叠');
+    assert.ok(rectsIntersect(A, { left: -5, top: -5, right: 5, bottom: 5 }), '反向重叠');
+    assert.ok(rectsIntersect(A, { left: 2, top: 2, right: 8, bottom: 8 }), '被包含');
+    assert.ok(rectsIntersect(A, { left: 10, top: 0, right: 20, bottom: 10 }), '边界相接算相交');
+    assert.ok(!rectsIntersect(A, { left: 11, top: 0, right: 20, bottom: 10 }), '右侧相离');
+    assert.ok(!rectsIntersect(A, { left: 0, top: 11, right: 10, bottom: 20 }), '下方相离');
+    assert.ok(!rectsIntersect(A, null), '空矩形');
+    assert.ok(!rectsIntersect(null, A), '空矩形');
+  });
+
+  test('computeMarqueeKeys：返回相交键并保持顺序，跳过无键/无矩形', () => {
+    const cards = [
+      { key: 'L:a', rect: { left: 0, top: 0, right: 10, bottom: 10 } },
+      { key: 'L:b', rect: { left: 100, top: 100, right: 110, bottom: 110 } },
+      { key: 'R:c', rect: { left: 5, top: 5, right: 15, bottom: 15 } },
+      { key: 'L:d', rect: null },
+      { rect: { left: 0, top: 0, right: 1, bottom: 1 } },
+    ];
+    const rect = { left: 0, top: 0, right: 12, bottom: 12 };
+    assert.deepEqual(computeMarqueeKeys(cards, rect), ['L:a', 'R:c']);
+    assert.deepEqual(computeMarqueeKeys(null, rect), []);
+  });
+});
+
+describe('纯函数：scrollStep（边缘自动滚动）', () => {
+  test('顶边 / 底边 / 中间分档', () => {
+    assert.deepEqual(scrollStep(400, 800, 40, 20), { dy: 0 }, '中间不滚动');
+    assert.deepEqual(scrollStep(0, 800, 40, 20), { dy: -20 }, '贴顶边最快向上');
+    assert.deepEqual(scrollStep(800, 800, 40, 20), { dy: 20 }, '贴底边最快向下');
+    assert.deepEqual(scrollStep(5, 800, 40, 20), { dy: -18 }, '接近顶边按比例');
+    assert.deepEqual(scrollStep(795, 800, 40, 20), { dy: 18 }, '接近底边按比例');
+    assert.deepEqual(scrollStep(40, 800, 40, 20), { dy: 0 }, '边界外不滚动');
   });
 });
 
@@ -1525,8 +1567,9 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
   // 构造 mock document：byId 缓存元素、createElement 记录 tagName
   function makeDocumentShim(byId) {
-    return {
+    const doc = {
       body: makeEl(),
+      _listeners: {},
       getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
       createElement(tag) {
         const el = makeEl();
@@ -1534,9 +1577,21 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return el;
       },
       createTextNode(t) { return { text: t }; },
-      addEventListener() {},
-      removeEventListener() {},
+      addEventListener(type, fn) {
+        (doc._listeners[type] || (doc._listeners[type] = [])).push(fn);
+      },
+      removeEventListener(type, fn) {
+        const a = doc._listeners[type];
+        if (!a) return;
+        const i = a.indexOf(fn);
+        if (i >= 0) a.splice(i, 1);
+      },
+      // 测试用：派发 document 级监听（真实浏览器由用户交互触发）
+      _trigger(type, ev) {
+        (doc._listeners[type] || []).slice().forEach((fn) => fn(ev || {}));
+      },
     };
+    return doc;
   }
 
   // 页面测试的 fetch 垫片外层：拦截服务端配置/历史接口，其余交给 baseShim。
@@ -2097,16 +2152,157 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
       'setTimeout', 'clearTimeout', m[1],
     )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
-    return { byId };
+    return { byId, doc: documentShim };
   }
 
   // 页面应内嵌图库批量选择/筛选工具条
   test('图库工具条含筛选/全选/批量删除控件', async () => {
     const html = await (await fetch(`${base}/`)).text();
-    ['galleryFilter', 'uniqueFilterWrap', 'filterUnique', 'uniqueFilterLabel', 'gallerySelInfo', 'gallerySelAll', 'galleryBatchDel']
+    ['galleryFilter', 'uniqueFilterWrap', 'filterUnique', 'uniqueFilterLabel', 'gallerySelInfo', 'gallerySelAll', 'galleryClearSel', 'galleryBatchDel']
       .forEach((id) => assert.ok(html.includes(`id="${id}"`), `页面应含 id="${id}"`));
     assert.ok(html.includes('makeGalleryCheck('), '应包含图库勾选框构建逻辑');
     assert.ok(html.includes('galleryBatchDelete'), '应包含批量删除逻辑');
+  });
+
+  // 画框选择：页面含相关代码；pointerdown 在垫片上不抛异常（含触摸应被忽略）
+  test('图库：画框选择代码存在且 pointerdown 安全', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    assert.ok(html.includes('pointerdown'), '应含 pointerdown 监听');
+    assert.ok(html.includes("className = 'marquee'"), '应含 marquee 元素创建');
+    assert.ok(html.includes('computeMarqueeKeys'), '应含画框命中计算');
+    assert.ok(html.includes('isMarqueeBlocked'), '应含起手区判定');
+
+    const store = new Map();
+    const { doc, byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library') ? { files: [] } : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    const grid = byId['grid'];
+    // 垫片无 getBoundingClientRect / setPointerCapture，处理器需安全降级、不抛异常
+    assert.doesNotThrow(() => {
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+    }, '网格空白 pointerdown 不应抛异常');
+    assert.doesNotThrow(() => {
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 2, clientX: -20, clientY: 0, target: doc.body, preventDefault() {} });
+    }, '从网格外页面空白 pointerdown 不应抛异常');
+    assert.doesNotThrow(() => {
+      doc._trigger('pointerdown', { pointerType: 'touch', button: 0, pointerId: 3, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+    }, '触摸 pointerdown 不应抛异常（应被忽略）');
+    assert.doesNotThrow(() => {
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 4, clientX: 0, clientY: 0, target: { tagName: 'IMG' }, preventDefault() {} });
+    }, '起点在卡片（IMG）上不应抛异常');
+  });
+
+  // 回归：自动滚动时框应随内容延伸（上边固定在内容上、下边随滚动变大），而不是整体跟着滚。
+  // 用可变的 histArea 视口矩形模拟页面滚动（top 变小）。
+  test('图库：画框随页面滚动延伸（坐标用文档稳定系）', async () => {
+    const store = new Map();
+    const { doc, byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library') ? { files: [] } : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    let scrollY = 0;
+    // 模拟 .hist-area 随页面滚动上移：视口 top 变小、bottom 同步上移
+    byId['histArea'].getBoundingClientRect = () => ({ left: 0, top: -scrollY, right: 1000, bottom: 1000 - scrollY });
+    const grid = byId['grid'];
+
+    doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 100, clientY: 100, target: grid, preventDefault() {} });
+    doc._trigger('pointermove', { pointerId: 1, clientX: 100, clientY: 200, altKey: false });
+    let el = findNode(byId['histArea'], (n) => n.className === 'marquee');
+    assert.ok(el, '应创建选择框元素');
+    assert.equal(el.style.top, '100px', '上边固定在起点');
+    assert.equal(el.style.height, '100px', '初始高度 100');
+
+    // 模拟自动滚动：内容上移 50，指针视口位置不变 → 下边应随内容延伸
+    scrollY = 50;
+    doc._trigger('pointermove', { pointerId: 1, clientX: 100, clientY: 200, altKey: false });
+    el = findNode(byId['histArea'], (n) => n.className === 'marquee');
+    assert.equal(el.style.top, '100px', '滚动后上边仍固定在内容上');
+    assert.equal(el.style.height, '150px', '滚动后下边随内容延伸（框变大）');
+  });
+
+  // 清空选择：有选择时才显示按钮；点击 / Esc 均可清空并隐藏按钮
+  test('图库：清空选择按钮按需显示，点击/Esc 清空', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const B = `${'b'.repeat(32)}-beta.png`;
+    const store = new Map();
+    const { doc, byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [
+              { name: A, size: 10, mtime: new Date().toISOString() },
+              { name: B, size: 20, mtime: new Date().toISOString() },
+            ] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(byId['galleryClearSel'].hidden, true, '无选择时「清空选择」应隐藏');
+
+    // 全选 → 按钮出现
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 2 张');
+    assert.equal(byId['galleryClearSel'].hidden, false, '有选择时「清空选择」应显示');
+
+    // 点击「清空选择」→ 清空并隐藏
+    byId['galleryClearSel']._trigger('click');
+    assert.equal(byId['gallerySelInfo'].textContent, '', '清空后无已选计数');
+    assert.equal(byId['galleryBatchDel'].textContent, '批量删除(0)');
+    assert.equal(byId['galleryBatchDel'].disabled, true, '清空后批量删除应置灰');
+    assert.equal(byId['galleryClearSel'].hidden, true, '清空后按钮应隐藏');
+
+    // 再全选后按 Esc → 同样清空并隐藏
+    byId['gallerySelAll']._trigger('click');
+    assert.equal(byId['galleryClearSel'].hidden, false);
+    doc._trigger('keydown', { key: 'Escape' });
+    assert.equal(byId['gallerySelInfo'].textContent, '', 'Esc 后无已选计数');
+    assert.equal(byId['galleryClearSel'].hidden, true, 'Esc 后按钮应隐藏');
+  });
+
+  // 回归：直接改 DOM 的勾选路径（点卡片勾选框，不触发 renderGrid）后，再「清空选择」应真正取消勾选。
+  // 修复前 prevCards 签名与 DOM 不一致，renderGrid 复用旧 DOM，卡片仍显示勾选。
+  test('图库：直接勾选后「清空选择」应取消勾选', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const store = new Map();
+    const { byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [{ name: A, size: 10, mtime: new Date().toISOString() }] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    const findCheck = () => findNode(grid, (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+
+    let check = findCheck();
+    assert.ok(check, '应存在卡片勾选框');
+    check.checked = true;
+    check._trigger('change'); // 直接改 DOM 路径（不触发 renderGrid）
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 1 张');
+
+    byId['galleryClearSel']._trigger('click'); // 清空选择
+    assert.equal(byId['gallerySelInfo'].textContent, '', '清空后无已选计数');
+    check = findCheck();
+    assert.ok(check, '应仍存在卡片勾选框');
+    assert.equal(check.checked, false, '清空后卡片勾选框应取消勾选');
+    assert.equal(byId['galleryClearSel'].hidden, true, '清空后按钮应隐藏');
   });
 
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选
