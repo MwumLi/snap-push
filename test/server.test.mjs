@@ -2272,6 +2272,39 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     assert.equal(byId['galleryClearSel'].hidden, true, 'Esc 后按钮应隐藏');
   });
 
+  // 回归：直接改 DOM 的勾选路径（点卡片勾选框，不触发 renderGrid）后，再「清空选择」应真正取消勾选。
+  // 修复前 prevCards 签名与 DOM 不一致，renderGrid 复用旧 DOM，卡片仍显示勾选。
+  test('图库：直接勾选后「清空选择」应取消勾选', async () => {
+    const A = `${'a'.repeat(32)}-alpha.png`;
+    const store = new Map();
+    const { byId } = await bootPage({
+      store,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        const body = u.includes('/api/library')
+          ? { files: [{ name: A, size: 10, mtime: new Date().toISOString() }] }
+          : { ok: true };
+        return { ok: true, status: 200, json: async () => body };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    const grid = byId['grid'];
+    const findCheck = () => findNode(grid, (n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+
+    let check = findCheck();
+    assert.ok(check, '应存在卡片勾选框');
+    check.checked = true;
+    check._trigger('change'); // 直接改 DOM 路径（不触发 renderGrid）
+    assert.equal(byId['gallerySelInfo'].textContent, '已选 1 张');
+
+    byId['galleryClearSel']._trigger('click'); // 清空选择
+    assert.equal(byId['gallerySelInfo'].textContent, '', '清空后无已选计数');
+    check = findCheck();
+    assert.ok(check, '应仍存在卡片勾选框');
+    assert.equal(check.checked, false, '清空后卡片勾选框应取消勾选');
+    assert.equal(byId['galleryClearSel'].hidden, true, '清空后按钮应隐藏');
+  });
+
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选
   test('图库：勾选 / 全选仅作用于可见卡片 / 关键字筛选', async () => {
     const A = `${'a'.repeat(32)}-alpha.png`;

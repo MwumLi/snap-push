@@ -2218,6 +2218,13 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     });
   }
 
+  // 直接改动某卡勾选态（不经 renderGrid）后，把其在 prevCards 的签名置为哨兵(null)，
+  // 令下次 renderGrid 重建该卡：否则签名会与旧值相等，reconcileCards 复用旧 DOM，
+  // 表现为「清空选择 / 全选」后卡片仍显示勾选。
+  function invalidateCardSig(key) {
+    (prevCards.grid || []).forEach(function (c) { if (c && c.key === key) c.sig = null; });
+  }
+
   // 图库卡片勾选框：更新 gallerySelected、切换卡片高亮、即时刷新工具条
   function makeGalleryCheck(key, card) {
     var lab = document.createElement('label');
@@ -2234,6 +2241,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         if (check.checked && !has) card.className += ' card-selected';
         else if (!check.checked && has) card.className = card.className.replace(' card-selected', '');
       }
+      invalidateCardSig(key); // DOM 已直接改动，作废旧签名
       updateGalleryToolbarLight();
     });
     card._check = check; // 复用卡片时就地刷新勾选可用性
@@ -2374,6 +2382,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
         if (on && !has) el.className += ' card-selected';
         else if (!on && has) el.className = el.className.replace(' card-selected', '');
       }
+      invalidateCardSig(k); // DOM 已直接改动，作废旧签名
     });
     updateGalleryToolbarLight();
   }
