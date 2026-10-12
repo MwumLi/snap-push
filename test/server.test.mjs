@@ -1567,8 +1567,9 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
 
   // 构造 mock document：byId 缓存元素、createElement 记录 tagName
   function makeDocumentShim(byId) {
-    return {
+    const doc = {
       body: makeEl(),
+      _listeners: {},
       getElementById(id) { return byId[id] || (byId[id] = makeEl()); },
       createElement(tag) {
         const el = makeEl();
@@ -1576,9 +1577,21 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
         return el;
       },
       createTextNode(t) { return { text: t }; },
-      addEventListener() {},
-      removeEventListener() {},
+      addEventListener(type, fn) {
+        (doc._listeners[type] || (doc._listeners[type] = [])).push(fn);
+      },
+      removeEventListener(type, fn) {
+        const a = doc._listeners[type];
+        if (!a) return;
+        const i = a.indexOf(fn);
+        if (i >= 0) a.splice(i, 1);
+      },
+      // 测试用：派发 document 级监听（真实浏览器由用户交互触发）
+      _trigger(type, ev) {
+        (doc._listeners[type] || []).slice().forEach((fn) => fn(ev || {}));
+      },
     };
+    return doc;
   }
 
   // 页面测试的 fetch 垫片外层：拦截服务端配置/历史接口，其余交给 baseShim。
@@ -2139,7 +2152,7 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
       'document', 'localStorage', 'window', 'fetch', 'console', 'URLSearchParams',
       'setTimeout', 'clearTimeout', m[1],
     )(documentShim, localStorageShim, windowShim, fetchShim, console, URLSearchParams, setTimeout, clearTimeout);
-    return { byId };
+    return { byId, doc: documentShim };
   }
 
   // 页面应内嵌图库批量选择/筛选工具条
@@ -2155,11 +2168,12 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
   test('图库：画框选择代码存在且 pointerdown 安全', async () => {
     const html = await (await fetch(`${base}/`)).text();
     assert.ok(html.includes('pointerdown'), '应含 pointerdown 监听');
-    assert.ok(html.includes("class = 'marquee'") || html.includes("className = 'marquee'"), '应含 marquee 元素创建');
+    assert.ok(html.includes("className = 'marquee'"), '应含 marquee 元素创建');
     assert.ok(html.includes('computeMarqueeKeys'), '应含画框命中计算');
+    assert.ok(html.includes('isMarqueeBlocked'), '应含起手区判定');
 
     const store = new Map();
-    const { byId } = await bootPage({
+    const { doc, byId } = await bootPage({
       store,
       fetchImpl: async (url) => {
         const u = String(url);
@@ -2171,14 +2185,17 @@ describe('内嵌页面脚本冒烟（DOM 垫片）', () => {
     const grid = byId['grid'];
     // 垫片无 getBoundingClientRect / setPointerCapture，处理器需安全降级、不抛异常
     assert.doesNotThrow(() => {
-      grid._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
-    }, '鼠标 pointerdown 不应抛异常');
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+    }, '网格空白 pointerdown 不应抛异常');
     assert.doesNotThrow(() => {
-      grid._trigger('pointerdown', { pointerType: 'touch', button: 0, pointerId: 2, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 2, clientX: -20, clientY: 0, target: doc.body, preventDefault() {} });
+    }, '从网格外页面空白 pointerdown 不应抛异常');
+    assert.doesNotThrow(() => {
+      doc._trigger('pointerdown', { pointerType: 'touch', button: 0, pointerId: 3, clientX: 0, clientY: 0, target: grid, preventDefault() {} });
     }, '触摸 pointerdown 不应抛异常（应被忽略）');
     assert.doesNotThrow(() => {
-      grid._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 3, clientX: 0, clientY: 0, target: { tagName: 'IMG' }, preventDefault() {} });
-    }, '起点在卡片上不应启动画框，也不应抛异常');
+      doc._trigger('pointerdown', { pointerType: 'mouse', button: 0, pointerId: 4, clientX: 0, clientY: 0, target: { tagName: 'IMG' }, preventDefault() {} });
+    }, '起点在卡片（IMG）上不应抛异常');
   });
 
   // 本机目标：勾选计数、全选只作用于可见卡片、关键字筛选

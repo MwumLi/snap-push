@@ -2384,12 +2384,39 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
     applyMarqueeSelection(computeMarqueeKeys(cards, rect), marquee.subtract);
   }
 
-  // 起点：仅 #grid 空白/间隙、左键、非触摸、非批量删除中
-  grid.addEventListener('pointerdown', function (e) {
+  // 起点是否落在禁止画框的元素上：交互控件、卡片、工具条、抽屉、弹窗、页头。
+  // 从 e.target 向上遍历判定，覆盖「点在卡片内任意位置/按钮上」等情形。
+  function isMarqueeBlocked(el) {
+    var BLOCK_TAGS = { A: 1, BUTTON: 1, INPUT: 1, LABEL: 1, SELECT: 1, TEXTAREA: 1, IMG: 1, VIDEO: 1, AUDIO: 1, OPTION: 1, HEADER: 1 };
+    var BLOCK_IDS = { syncDrawer: 1, confirmMask: 1, managePanel: 1, dropZone: 1, serverForm: 1 };
+    var node = el;
+    var depth = 0;
+    while (node && depth < 60) {
+      if (node.tagName && BLOCK_TAGS[node.tagName]) return true;
+      if (node.id && BLOCK_IDS[node.id]) return true;
+      if (typeof node.className === 'string' &&
+        (node.className.indexOf('card') >= 0 || node.className.indexOf('gallery-bar') >= 0)) return true;
+      node = node.parentNode;
+      depth++;
+    }
+    return false;
+  }
+
+  // 起点 Y 是否落在图库竖直带内（工具栏下方到图库结束）；无测量能力（如测试垫片）时放行
+  function marqueeInBand(clientY) {
+    if (!histArea || typeof histArea.getBoundingClientRect !== 'function') return true;
+    var box = histArea.getBoundingClientRect();
+    return clientY >= box.top - 6 && clientY <= box.bottom + 6;
+  }
+
+  // 起点：图库区周边空白（含首列左侧页面空白）。用 document 级监听以支持从网格外起手；
+  // 落在交互元素/卡片/工具条/抽屉/弹窗上，或不在图库竖直带内，则不启动。
+  document.addEventListener('pointerdown', function (e) {
     if (galleryBusy) return;
-    if (e.pointerType === 'touch') return; // 触摸屏不画框（保持原生滚动）
-    if (e.button !== 0) return;            // 仅左键
-    if (e.target !== grid) return;         // 起点落在卡片/控件上则不启动
+    if (e.pointerType === 'touch') return;  // 触摸屏不画框（保持原生滚动）
+    if (e.button !== 0) return;             // 仅左键
+    if (isMarqueeBlocked(e.target)) return; // 落在交互元素/卡片/控件上则不启动
+    if (!marqueeInBand(e.clientY)) return;  // 仅图库竖直带内（不影响页头/上传区）
     marquee.active = true;
     marquee.pointerId = e.pointerId;
     marquee.subtract = !!e.altKey;
